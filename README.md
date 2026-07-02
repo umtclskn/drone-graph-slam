@@ -55,21 +55,7 @@ All numbers below are from `bags/slam_loop_02` (see [Evaluation](#evaluation--re
 
 ## System architecture `[DEMONSTRATED]` core · `[DESIGNED]` full spec
 
-```
-LiDAR ─► Preprocess ─► Quality gate ─► NDT voxel grid ─► NDT registrar ─► RegistrationResult
-(PointCloud2)  (crop/downsample)   (NDT-04)     (per-voxel Gaussians)   (own score+Newton)  {ΔT, score, Σ_meas}
-                                                                                    │
-PX4 EKF2 odom ─► (adapter) ─► /odometry/ekf2 ──────────► initial guess (NDT-08) ────┤
-                                                                                    ▼
-                                                        OdometryAccumulator (compound ΔT + Σ_prop via SE3 adjoint)
-                                                                                    │  on keyframe (SLAM-01)
-                                                                                    ▼
-                                    ┌──────────► FactorGraph (PriorFactor + BetweenFactor) ─► iSAM2 ─► Σ_post
-                                    │                                                             │
-             LoopClosureCandidateFinder ─► LoopClosureVerifier (NDT) ──────────────────────────┤
-                                    │                                                             ▼
-                                    └────────────────────────────────► GT bridge ─► CSV / RViz (paths, ellipsoids)
-```
+![System architecture: NDT front-end, EKF2 prior, odometry accumulator, GTSAM back-end with loop closure, and evaluation outputs](docs/figures/slam_architecture.png)
 
 Two design pillars:
 
@@ -179,13 +165,12 @@ Two design pillars:
 | RPE translation (δ=10) | 3.043 m | 0.509 m | 6.0× |
 | Per-pair \|t\| recovered | 44.3% | **98.1%** | near-full |
 
-| Identity guess (dead-reckon drifts) | EKF2 prior (tracks GT) |
-|---|---|
-| ![](docs/figures/eval02_trajectory.png) | ![](docs/figures/eval02_trajectory_prior.png) |
+![EKF2-prior NDT odometry tracks the ground-truth loop](docs/figures/eval02_trajectory_prior.png)
 
-*From an identity guess the NDT increments are correctly **directed** but **under-scaled**
-(~44% of true motion), so the dead-reckoned path curls away — a demonstrated diagnostic
-that motivates both the prior and the graph back-end.*
+*Dead-reckoned NDT odometry with the EKF2 prior as initial guess — it tracks the GT loop.
+From an identity guess (no prior) the NDT increments are correctly **directed** but
+**under-scaled** (~44% of true motion), so the path curls away and ATE blows up to 8.56 m —
+a demonstrated diagnostic that motivates both the prior and the graph back-end.*
 
 ### Loop closure corrects drift, and uncertainty is consistent
 
