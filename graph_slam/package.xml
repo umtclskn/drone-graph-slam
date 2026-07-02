@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>graph_slam</name>
+  <version>0.0.0</version>
+  <description>
+    Drone Graph-SLAM core: NDT scan-to-scan front-end + GTSAM back-end + loop
+    closure. PX4-agnostic, ROS-free algorithm classes built on PCL and GTSAM.
+  </description>
+  <maintainer email="umtclskn@gmail.com">umut</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <!-- NDT-01: point_types.hpp aliases pcl::PointCloud<PointXYZI> (common). -->
+  <!-- filters (VoxelGrid/PassThrough) and registration (NDT) land with their  -->
+  <!-- own stories (NDT-05/06/09). pcl_conversions stays in NDT-02 only.        -->
+  <depend>libpcl-dev</depend>
+  <!-- NDT-03: Eigen is exposed in PreprocessConfig (crop bounds); link target  -->
+  <!-- Eigen3::Eigen is a PUBLIC dependency of the graph_slam library.          -->
+  <depend>eigen</depend>
+
+  <!-- EVAL-03: the overlay node executable (eval03_overlay_node) only. The core -->
+  <!-- graph_slam library is NOT linked against these - it stays ROS-free.       -->
+  <depend>rclcpp</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
+  <!-- SLAM-11: graph_backend_node publishes /slam/diagnostics (std_msgs/String). -->
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <!-- NDT-13: ndt_frontend_node publishes ~/ndt_odom (nav_msgs/Odometry) and -->
+  <!-- subscribes the EKF2 prior (nav_msgs/Odometry). -->
+  <depend>nav_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>pcl_conversions</depend>
+  <depend>ament_index_cpp</depend>
+  <!-- EVAL-03: scripts/eval03_plot.py renders the 2D overlay (matplotlib). -->
+  <exec_depend>python3-matplotlib</exec_depend>
+
+  <!-- NDT-03: gtest unit tests for the Preprocessor (PCL filters: libpcl-dev). -->
+  <test_depend>ament_cmake_gtest</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

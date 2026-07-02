@@ -1,0 +1,81 @@
+# INFRA-02: central NDT-pipeline knobs. Loaded by the eval node launch files so a
+# change here alters behaviour WITHOUT a rebuild. The `/**` wildcard applies these
+# to every node that declares them; each node only reads the keys it uses (extra
+# keys are ignored). Defaults below MATCH the in-code defaults (NdtConfig /
+# RegistrationGateConfig / PreprocessConfig), so loading this file changes nothing
+# until a value is edited.
+#
+# Keyframe thresholds (SLAM-01) are intentionally NOT here yet -- nothing reads
+# them; add them when that story lands.
+/**:
+  ros__parameters:
+    # Preprocessing (NDT-03 PreprocessConfig)
+    voxel_leaf: 0.2                  # m, downsample leaf size
+
+    # NDT voxel grid (NDT-05/06) + optimiser (NDT-09 NdtConfig)
+    ndt_resolution: 1.0              # m, target Gaussian voxel size
+    ndt_max_iterations: 35           # Newton iterations cap
+    ndt_step_epsilon: 0.0001         # converged once ||delta p|| < this
+    ndt_outlier_ratio: 0.55          # Magnusson Gaussian/uniform mixture weight
+    ndt_regularization: 0.000001     # Hessian eigenvalue floor (PD guard)
+
+    # Measurement covariance Sigma_meas from the cost Hessian (NDT-12 NdtConfig).
+    # Flat keys (ndt_*) to match the convention above, not the nested form.
+    ndt_hessian_lambda: 1.0          # Sigma_meas = lambda * H^-1 (unit scale)
+    # EVAL-05 NEES calibration (analysis/nees_report.txt): the Hessian gives the
+    # right SHAPE but wrong SCALE, so Sigma_meas is ~435x overconfident. This scalar
+    # multiplies the Hessian-based Sigma_meas (front-end odometry AND loop edges).
+    # In-code default is 1.0; alpha = mean_NEES/dim = 1306/3 = 435 on slam_loop_02.
+    ndt_cov_scale_factor: 435.0      # Sigma_meas = cov_scale_factor * lambda * H^-1
+    ndt_sigma_rot_fallback: 0.01     # rad, fallback rotation std (degenerate H)
+    ndt_sigma_t_fallback: 0.1        # m,   fallback translation std (degenerate H)
+    ndt_sigma_max_condition: 1000000.0  # H condition number above this -> fallback
+
+    # Registration gate (NDT-11 RegistrationGateConfig)
+    gate_max_fitness_score: -0.5     # reject PoorFit when fitness ABOVE this
+    gate_min_hessian_eigenvalue: 0.001
+    gate_max_condition_number: 10000.0
+
+    # Input-side scan quality gate (NDT-04 QualityConfig). Flat keys (quality_*) to
+    # match the convention above. Nothing reads these yet -- the QualityChecker is
+    # wired into the pipeline at NDT-13 -- so they only stage the knobs for then.
+    quality_min_points: 100               # reject scans sparser than this
+    quality_min_spread_eigenvalue: 0.1    # m^2, smallest PCA eigenvalue floor
+
+    # NDT-13 front-end node (ndt_frontend_node). Flat keys (not the nested `node:`
+    # block) to match the /** wildcard convention above: each maps to one
+    # declare_parameter in the node, so a YAML edit retunes without a rebuild.
+    lidar_topic: "/x500/lidar_3d/points"  # input cloud (remappable)
+    ekf2_topic: "/odometry/ekf2"          # NDT-08 prior (nav_msgs/Odometry, ENU)
+    odom_frame: "odom"                    # ~/ndt_odom header.frame_id
+    base_frame: "base_link"               # ~/ndt_odom child_frame_id
+    min_translation_m: 0.3                # keyframe trigger: translation since last KF
+    min_rotation_deg: 5.0                 # keyframe trigger: rotation since last KF
+    publish_debug_clouds: true            # ~/scan_raw + ~/scan_target debug topics
+
+    # SLAM-09 loop-closure candidate finder (graph_backend_node). Detection only;
+    # SLAM-10 will verify candidates with NDT before adding a BetweenFactor. Tune
+    # loop_min_distance_m up (1.0, 2.0) if no candidate is seen on revisit.
+    loop_min_distance_m: 2.0          # m, candidate only if revisit dist < this
+    loop_min_age_difference: 10       # match must be >= this many keyframes older
+
+    # SLAM-10 loop-closure verifier (graph_backend_node). Runs NDT between the
+    # candidate keyframe clouds and accepts only a strong + well-conditioned match
+    # before adding a BetweenFactor (a false closure corrupts the graph, §8). The
+    # back-end buffers the front-end's preprocessed scan (scan_topic) so each
+    # keyframe keeps its cloud for verification.
+    scan_topic: "/ndt_frontend/scan_raw"  # preprocessed cloud feeding NDT verification
+    loop_min_ndt_score: -0.8             # accept only if NDT fitness <= this (lower = better)
+    loop_min_sigma_eigenvalue: 0.000001  # reject if worst Hessian eigenvalue below this
+    loop_max_condition_number: 10000.0   # reject if Hessian condition number above this
+
+    # INFRA-01: static base_link -> lidar_link mount offset (launch file reads these).
+    # Identity = lidar at base_link origin. Keys name the lidar-in-base offset; the
+    # launch static_transform_publisher publishes parent=base_link child=lidar_link.
+    tf:
+      lidar_to_base_x: 0.0
+      lidar_to_base_y: 0.0
+      lidar_to_base_z: 0.0
+      lidar_to_base_roll: 0.0
+      lidar_to_base_pitch: 0.0
+      lidar_to_base_yaw: 0.0

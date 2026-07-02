@@ -1,0 +1,53 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+Visualization Manager:
+  Global Options:
+    Fixed Frame: lidar
+    Frame Rate: 30
+  Displays:
+    - Class: rviz_default_plugins/Grid
+      Name: Grid
+      Enabled: true
+      Cell Size: 1
+      Plane Cell Count: 20
+    - Class: rviz_default_plugins/PointCloud2
+      Name: source (red)
+      Enabled: true
+      Topic:
+        Value: /eval03_overlay/source
+        Depth: 5
+        Reliability Policy: Reliable
+      Color Transformer: FlatColor
+      Color: 255; 0; 0
+      Size (Pixels): 3
+      Style: Points
+    - Class: rviz_default_plugins/PointCloud2
+      Name: target (green)
+      Enabled: true
+      Topic:
+        Value: /eval03_overlay/target
+        Depth: 5
+        Reliability Policy: Reliable
+      Color Transformer: FlatColor
+      Color: 0; 255; 0
+      Size (Pixels): 3
+      Style: Points
+    - Class: rviz_default_plugins/PointCloud2
+      Name: aligned (blue)
+      Enabled: true
+      Topic:
+        Value: /eval03_overlay/aligned
+        Depth: 5
+        Reliability Policy: Reliable
+      Color Transformer: FlatColor
+      Color: 0; 0; 255
+      Size (Pixels): 3
+      Style: Points
+  Tools:
+    - Class: rviz_default_plugins/MoveCamera
+  Views:
+    Current:
+      Class: rviz_default_plugins/Orbit
+      Distance: 15
+      Name: Orbit

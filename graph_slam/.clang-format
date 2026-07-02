@@ -1,0 +1,3 @@
+# ROS 2 C++ style: Google-based, 100-column limit
+BasedOnStyle: Google
+ColumnLimit: 100
