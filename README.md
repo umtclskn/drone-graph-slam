@@ -4,6 +4,14 @@
 scan-to-scan front-end, a GTSAM factor-graph back-end (prior + `BetweenFactor` +
 iSAM2), and NDT-verified loop closure — running in PX4 + Gazebo SITL.**
 
+<p align="center">
+  <video src="https://github.com/umtclskn/drone-graph-slam/raw/main/docs/gazebo_px4_x500_slam_trimmed.mp4" controls muted width="85%"></video>
+</p>
+
+<p align="center"><em>Live PX4 + Gazebo SITL — the x500 flies the room loop while the NDT front-end + GTSAM
+back-end + loop closure build the graph in RViz. ▶ <a href="docs/gazebo_px4_x500_slam_trimmed.mp4">watch / download the clip</a>
+if the inline player doesn't load.</em></p>
+
 > Each section is tagged **`[DEMONSTRATED]`** (built and reproducible from a recorded
 > bag), **`[DESIGNED]`** (specified, partially built), or **`[PLANNED]`** (future work),
 > so "what works" is never blurred with "what's planned."
@@ -269,6 +277,83 @@ ros2 run tf2_ros tf2_echo map odom   # non-identity after loop closure
 python3 graph_slam/scripts/eval05_plot.py analysis/eval05_covariance_log.csv
 python3 graph_slam/scripts/eval02_trajectory.py analysis/eval02_trajectory_prior.csv
 ```
+
+---
+
+## Live SITL demo (no bag) `[DEMONSTRATED]`
+
+Run the whole stack live against PX4 SITL + Gazebo (instead of replaying a bag) — this is
+what produces a real-time RViz view of the graph growing and snapping at loop closure, for a
+screen recording. **Every ROS terminal first sources the overlay:**
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/portfolio_ws/drone_ws/install/setup.bash
+```
+
+Requires PX4-Autopilot with the `x500_lidar_down` model + `my_slam_world` world, the
+Micro-XRCE-DDS Agent, and `ros_gz_bridge`.
+
+**0. Build once**
+```bash
+cd ~/portfolio_ws/drone_ws
+colcon build && source install/setup.bash
+```
+
+**1. Terminal 1 — Micro-XRCE-DDS Agent** *(start before PX4)*
+```bash
+MicroXRCEAgent udp4 -p 8888
+```
+
+**2. Terminal 2 — PX4 SITL + Gazebo** (room world, 3D-LiDAR x500)
+```bash
+cd ~/PX4-Autopilot
+PX4_GZ_WORLD=my_slam_world make px4_sitl gz_x500_lidar_down
+```
+Wait for EKF2 to converge, then in the same PX4 shell (`pxh>`) relax the arming checks so an
+RC-/GCS-less offboard flight can arm — **SITL demo only; never disable these for real flight:**
+```bash
+param set NAV_DLL_ACT 0      # no GCS-datalink failsafe -> clears "No connection to the GCS"
+param set COM_RCL_EXCEPT 4   # allow Offboard without RC
+```
+
+**3. Terminal 3 — Gazebo -> ROS bridge** (LiDAR + clock)
+```bash
+ros2 run ros_gz_bridge parameter_bridge \
+  /x500/lidar_3d/points@sensor_msgs/msg/PointCloud2[gz.msgs.PointCloudPacked \
+  /clock@rosgraph_msgs/msg/Clock[gz.msgs.Clock
+# verify: ros2 topic hz /x500/lidar_3d/points   -> ~10 Hz
+```
+
+**4. Terminal 4 — PX4 -> ROS bridges** (EKF2 prior + ground truth)
+```bash
+ros2 launch px4_offboard ekf2_odometry_adapter.launch.py &
+ros2 launch px4_offboard ground_truth_bridge.launch.py
+```
+
+**5. Terminal 5 — RViz** (SLAM view — the window to record)
+```bash
+rviz2 -d ~/portfolio_ws/drone_ws/src/drone-graph-slam/graph_slam/config/drone_graph_slam_sim.rviz \
+      --ros-args -p use_sim_time:=true
+```
+
+**6. Terminal 6 — SLAM stack** (NDT front-end + GTSAM back-end)
+```bash
+ros2 launch graph_slam graph_backend.launch.py
+# verify: ros2 topic hz /slam/graph_path
+```
+
+**7. Terminal 7 — Fly the mission** *(last — drives the whole pipeline)*
+```bash
+ros2 run px4_offboard offboard_control
+```
+Arms -> takes off -> flies the rectangular loop -> lands. In RViz the graph grows, GT vs
+estimate paths draw, and the loop closure snaps the trajectory + shrinks the covariance
+ellipsoids as the drone returns near the start.
+
+> **Order matters:** 1 → 2 (EKF2 ready + params) → 3 → 4 → 5/6 → 7. The agent starts before
+> PX4; `offboard_control` runs last. Shut down with Ctrl-C in reverse order; a stray Gazebo
+> may need `pkill -9 -f 'gz sim'`.
 
 ---
 
