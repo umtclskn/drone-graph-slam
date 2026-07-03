@@ -158,6 +158,64 @@ Two design pillars:
 
 ---
 
+## Keyframe & factor decision flow `[DEMONSTRATED]`
+
+How a raw LiDAR scan becomes (or does not become) a graph node and a factor — with the real
+gates, thresholds, and fallbacks from the code. Note the **two keyframe layers**: the
+front-end keeps a *registration* keyframe (the current NDT target grid), while the back-end
+keeps the *graph* keyframe (a GTSAM node). They use different thresholds.
+
+```mermaid
+flowchart TD
+    subgraph FE["NDT front-end — per LiDAR scan (ndt_frontend_node)"]
+        A["LiDAR scan /x500/lidar_3d/points"] --> B["Preprocess: crop, voxel downsample, NaN/inf removal"]
+        B --> C{"Quality gate (NDT-04)<br/>points ≥ 100 AND spread ≥ 0.1?"}
+        C -- "no" --> Cx["DROP scan (log + skip)"]
+        C -- "yes" --> D{"registration keyframe exists?"}
+        D -- "no (first scan)" --> D0["set keyframe at origin;<br/>publish identity odom"]
+        D -- "yes" --> E["initial guess =<br/>EKF2 prior if available, else identity"]
+        E --> F["NDT align: scan vs keyframe grid<br/>own score + Newton → transform + Hessian"]
+        F --> G{"Hessian well-conditioned?<br/>min_eig > 0 AND cond ≤ 1e6"}
+        G -- "yes" --> G1["Σ_meas = 435 · H⁻¹ (from Hessian)"]
+        G -- "no (degenerate)" --> G2["Σ_meas = diag(σrot=0.01, σt=0.1) (fallback)"]
+        G1 --> H["NDT-11 verdict: Reliable / PoorFit / Degenerate<br/>logged as diagnostic — does NOT drop odom"]
+        G2 --> H
+        H --> I{"front-end keyframe gate:<br/>moved ≥ 0.3 m OR turned ≥ 5°?"}
+        I -- "no" --> Ix["skip (sub-motion; no odom emitted)"]
+        I -- "yes" --> J["publish /ndt_frontend/ndt_odom<br/>(pose + Σ_meas); advance keyframe to this scan"]
+    end
+
+    J --> K
+    subgraph BE["GTSAM back-end — per ndt_odom (graph_backend_node)"]
+        K{"graph bootstrapped?"}
+        K -- "no (first)" --> K0["add x0 + PriorFactor σ=0.001 [SLAM-04];<br/>iSAM2 update"]
+        K -- "yes" --> L["delta = last⁻¹ ∘ current;<br/>accumulate (delta, Σ_meas) → Σ_prop compounds via SE3 adjoint [SLAM-03]"]
+        L --> M{"keyframe policy [SLAM-01]<br/>accum ≥ 0.5 m OR ≥ 0.5 rad OR ≥ 10 s?"}
+        M -- "no" --> Mx["wait (keep accumulating)"]
+        M -- "yes" --> N["add BetweenFactor(x_prev, x_cur, delta, Σ_prop) [SLAM-05];<br/>iSAM2 update; reset accumulator; store keyframe cloud"]
+        N --> O{"loop candidate? [SLAM-09]<br/>revisit < 2.0 m AND ≥ 10 KF older"}
+        O -- "none" --> Ox["done (open chain — Σ_post grows)"]
+        O -- "candidate" --> P{"verify by NDT [SLAM-10]<br/>converged AND score ≤ -0.8 AND<br/>well-conditioned (min_eig ≥ 1e-6, cond ≤ 1e4)?"}
+        P -- "reject" --> Px["log only; graph untouched"]
+        P -- "accept" --> Q["add loop BetweenFactor(match, query, Σ_meas);<br/>iSAM2 re-optimize → map→odom jumps, Σ_post shrinks"]
+    end
+```
+
+**Gates, thresholds & fallbacks (defaults from `config/slam_params.yaml` + `graph_backend.launch.py`, all tunable):**
+
+| Stage | Rule | Effect |
+|---|---|---|
+| Input quality gate (NDT-04) | `points ≥ 100` AND `spread_eigenvalue ≥ 0.1` | **hard-drops** the scan before NDT runs |
+| Front-end keyframe/emit gate | `moved ≥ 0.3 m` OR `turned ≥ 5°` | scan-to-keyframe: only emit odom + advance the NDT target on enough motion |
+| Σ_meas (NDT-12) | `Σ_meas = 435 · H⁻¹` from the cost Hessian | per-measurement covariance (435 = NEES calibration scalar) |
+| Σ_meas degenerate fallback | `cond > 1e6` OR `min_eig ≤ 0` | replace with `diag(σrot=0.01 rad, σt=0.1 m)` → down-weights ambiguous geometry instead of dropping it |
+| NDT-11 verdict | Reliable / PoorFit / Degenerate | **diagnostic only** — the front-end does *not* hard-drop odom; hard rejection lives at the quality gate and the loop verifier |
+| Bootstrap (SLAM-04) | first node `x0` + tight `PriorFactor` (σ=0.001) | anchors the graph |
+| Back-end keyframe policy (SLAM-01) | `accum ≥ 0.5 m` OR `≥ 0.5 rad` OR `≥ 10 s` (OR semantics; a non-positive threshold disables that criterion) | triggers a new graph node + BetweenFactor |
+| Odometry factor (SLAM-05) | `BetweenFactor` noise = compounded `Σ_prop` | drift-uncertainty-weighted edge |
+| Loop candidate (SLAM-09) | revisit `< 2.0 m` AND match `≥ 10` keyframes older | proposes a closure |
+| Loop verify (SLAM-10) | converged AND `score ≤ -0.8` AND well-conditioned (`min_eig ≥ 1e-6`, `cond ≤ 1e4`) | accept → cross-edge + re-optimize; reject → untouched; one closure per keyframe |
+
 ## Evaluation & results `[DEMONSTRATED]`
 
 > Reproduced from `bags/slam_loop_02`. **Ground truth = PX4 EKF2** on this bag (see
