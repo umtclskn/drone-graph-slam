@@ -5,12 +5,11 @@ scan-to-scan front-end, a GTSAM factor-graph back-end (prior + `BetweenFactor` +
 iSAM2), and NDT-verified loop closure — running in PX4 + Gazebo SITL.**
 
 <p align="center">
-  <video src="https://github.com/umtclskn/drone-graph-slam/raw/main/docs/gazebo_px4_x500_slam_trimmed.mp4" controls muted width="85%"></video>
+  <img src="docs/gazebo_px4_x500_slam_trimmed.gif" alt="Live PX4 + Gazebo SITL demo" width="85%">
 </p>
 
 <p align="center"><em>Live PX4 + Gazebo SITL — the x500 flies the room loop while the NDT front-end + GTSAM
-back-end + loop closure build the graph in RViz. ▶ <a href="docs/gazebo_px4_x500_slam_trimmed.mp4">watch / download the clip</a>
-if the inline player doesn't load.</em></p>
+back-end + loop closure build the graph in RViz.</em></p>
 
 > Each section is tagged **`[DEMONSTRATED]`** (built and reproducible from a recorded
 > bag), **`[DESIGNED]`** (specified, partially built), or **`[PLANNED]`** (future work),
