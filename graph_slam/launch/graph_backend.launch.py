@@ -82,9 +82,8 @@ def _launch_setup(context, *args, **kwargs):
                 {
                     "use_sim_time": use_sim_time,
                     "ndt_odom_topic": "/ndt_frontend/ndt_odom",
-                    "keyframe_translation_m": LaunchConfiguration("keyframe_translation_m"),
-                    "keyframe_rotation_rad": LaunchConfiguration("keyframe_rotation_rad"),
-                    "keyframe_time_s": LaunchConfiguration("keyframe_time_s"),
+                    # Keyframe thresholds come from slam_params.yaml (keyframe_*),
+                    # the single knob file — no launch-arg override layer.
                 },
             ],
         ),
@@ -128,9 +127,6 @@ def generate_launch_description():
             DeclareLaunchArgument("lidar_topic", default_value="/x500/lidar_3d/points"),
             DeclareLaunchArgument("ekf2_topic", default_value="/odometry/ekf2"),
             DeclareLaunchArgument("publish_debug_clouds", default_value="true"),
-            DeclareLaunchArgument("keyframe_translation_m", default_value="0.5"),
-            DeclareLaunchArgument("keyframe_rotation_rad", default_value="0.5"),
-            DeclareLaunchArgument("keyframe_time_s", default_value="10.0"),
             DeclareLaunchArgument("rviz", default_value="false"),
             DeclareLaunchArgument("rviz_config", default_value=rviz_config),
             OpaqueFunction(function=_launch_setup),

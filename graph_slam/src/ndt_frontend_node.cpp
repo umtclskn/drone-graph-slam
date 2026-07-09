@@ -3,7 +3,8 @@
 // Per scan (ARCHITECTURE §4 order):
 //   LiDAR -> Preprocessor -> QualityChecker (NDT-04, reject -> log + skip)
 //         -> NdtVoxelGrid (target = current keyframe) -> NdtRegistrar.align
-//            (NDT-08 EKF2 prior as initial guess) -> NDT-11 gate verdict
+//            (NDT-08 EKF2 prior as initial guess) -> NDT-11 gate ENFORCED:
+//            non-Reliable -> EKF2-delta fallback (or skip when no prior)
 //         -> NDT-12 Sigma_meas -> publish ~/ndt_odom.
 //
 // Keyframe policy (simple, YAGNI): the first accepted scan is the keyframe; each
@@ -24,6 +25,7 @@
 #include <array>
 #include <cmath>
 #include <memory>
+#include <utility>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -92,7 +94,8 @@ std::array<double, 36> sigmaToNavCovariance(const Matrix6f& sigma) {
 
 class NdtFrontendNode : public rclcpp::Node {
  public:
-  NdtFrontendNode() : rclcpp::Node("ndt_frontend") {
+  explicit NdtFrontendNode(rclcpp::NodeOptions options)
+      : rclcpp::Node("ndt_frontend", options) {
     lidar_topic_ = declare_parameter<std::string>("lidar_topic", "/x500/lidar_3d/points");
     ekf2_topic_ = declare_parameter<std::string>("ekf2_topic", "/odometry/ekf2");
     odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
@@ -190,8 +193,30 @@ class NdtFrontendNode : public rclcpp::Node {
     const RegistrationResult result =
         NdtRegistrar{ndt_cfg_}.align(*keyframe_grid_, scan, init_guess);
     const RegistrationStatus verdict = evaluateRegistration(result, gate_cfg_);
-    const double moved_m = result.transform.block<3, 1>(0, 3).norm();
-    const double turned_deg = rotationAngle(result.transform) * 180.0 / M_PI;
+
+    // NDT-11 gate ENFORCEMENT: a rejected registration must not enter the
+    // odometry chain (a confident wrong factor wrecks the graph). Fallback:
+    // trust the EKF2 relative motion for this step, with the geometry-agnostic
+    // fallback covariance (the NDT Hessian is meaningless here). Without a
+    // prior the scan is skipped and the keyframe stays put.
+    Eigen::Matrix4f delta = result.transform;
+    Matrix6f sigma = result.sigma_meas;
+    if (verdict != RegistrationStatus::Reliable) {
+      if (!used_prior) {
+        RCLCPP_WARN(get_logger(),
+                    "NDT rejected (%s) and no EKF2 prior available; scan skipped.",
+                    toString(verdict));
+        return;
+      }
+      delta = init_guess;
+      sigma = measurementCovariance(Eigen::Matrix<double, 6, 6>::Zero(), ndt_cfg_).sigma;
+      RCLCPP_WARN(get_logger(),
+                  "NDT rejected (%s); using the EKF2 delta as fallback for this step.",
+                  toString(verdict));
+    }
+
+    const double moved_m = delta.block<3, 1>(0, 3).norm();
+    const double turned_deg = rotationAngle(delta) * 180.0 / M_PI;
     RCLCPP_INFO(get_logger(),
                 "NDT: converged=%d iters=%d fitness=%.3f -> %s | moved %.3f m / %.2f deg | "
                 "prior=%s (guess t=%.3f m)",
@@ -203,8 +228,8 @@ class NdtFrontendNode : public rclcpp::Node {
     if (moved_m < min_translation_m_ && turned_deg < min_rotation_deg_) {
       return;
     }
-    const Eigen::Matrix4f world_from_current = world_from_keyframe_ * result.transform;
-    publishOdom(world_from_current, result.sigma_meas, msg->header.stamp);
+    const Eigen::Matrix4f world_from_current = world_from_keyframe_ * delta;
+    publishOdom(world_from_current, sigma, msg->header.stamp);
     setKeyframe(scan, world_from_current, msg->header);
   }
 
@@ -289,8 +314,8 @@ class NdtFrontendNode : public rclcpp::Node {
 
 }  // namespace
 
-std::shared_ptr<rclcpp::Node> createNdtFrontendNode() {
-  return std::make_shared<NdtFrontendNode>();
+std::shared_ptr<rclcpp::Node> createNdtFrontendNode(rclcpp::NodeOptions options) {
+  return std::make_shared<NdtFrontendNode>(std::move(options));
 }
 
 }  // namespace graph_slam

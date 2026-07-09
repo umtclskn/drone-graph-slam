@@ -9,6 +9,8 @@
 // anonymous namespace in ndt_frontend_node.cpp.
 namespace graph_slam {
 
-std::shared_ptr<rclcpp::Node> createNdtFrontendNode();
+/// `options` lets tests inject parameter overrides (e.g. gate thresholds);
+/// production callers use the default.
+std::shared_ptr<rclcpp::Node> createNdtFrontendNode(rclcpp::NodeOptions options = {});
 
 }  // namespace graph_slam

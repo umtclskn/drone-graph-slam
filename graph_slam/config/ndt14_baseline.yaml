@@ -6,17 +6,18 @@
 # script on purpose: a refactor that legitimately shifts the numbers is a
 # one-line edit here, and the bounds stay visible/reviewable.
 #
-# Reference numbers come from the NDT-13 smoke run on slam_loop_02
-# (258 registrations -> 120 publishes, 8 Degenerate, EKF2 prior connected).
-# The bounds are deliberately looser than the observed values so they catch a
-# real regression, not normal run-to-run jitter.
+# Reference numbers: the NDT-13 smoke run on slam_loop_02 observed
+# 258 registrations -> 120 publishes with 8 Degenerate; the latest harness run
+# (analysis/ndt14_report.txt, 2026-06-18) observed 187 publishes, 0/258
+# Degenerate. The bounds are deliberately looser than the observed values so
+# they catch a real regression, not normal run-to-run jitter.
 ndt14_baseline:
   # Lower bound on how many ~/ndt_odom messages the front-end must emit over the
-  # bag. NDT-13 observed 120; 100 leaves margin for keyframe-timing jitter.
+  # bag. Observed 120-187 across runs; 100 leaves margin for keyframe jitter.
   min_published_odom: 100
 
   # Upper bound on the fraction of registrations the NDT-11 gate flags Degenerate.
-  # NDT-13 observed 8/120 ~= 0.07; 0.15 is a generous ceiling.
+  # Observed 0-8 per run; 0.15 is a generous ceiling.
   max_degenerate_ratio: 0.15
 
   # Upper bound on the mean origin-anchored translation error between ~/ndt_odom

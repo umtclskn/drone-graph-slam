@@ -1,12 +1,12 @@
-# INFRA-02: central NDT-pipeline knobs. Loaded by the eval node launch files so a
-# change here alters behaviour WITHOUT a rebuild. The `/**` wildcard applies these
-# to every node that declares them; each node only reads the keys it uses (extra
-# keys are ignored). Defaults below MATCH the in-code defaults (NdtConfig /
-# RegistrationGateConfig / PreprocessConfig), so loading this file changes nothing
-# until a value is edited.
-#
-# Keyframe thresholds (SLAM-01) are intentionally NOT here yet -- nothing reads
-# them; add them when that story lands.
+# INFRA-02: the ONE central knob file for the whole SLAM stack. Loaded by the
+# production launches (ndt_frontend.launch.py, graph_backend.launch.py) and the
+# eval node launches, so a change here alters behaviour WITHOUT a rebuild. The
+# `/**` wildcard applies these to every node that declares them; each node only
+# reads the keys it uses (extra keys are ignored). Unless noted, values MATCH
+# the in-code defaults (NdtConfig / RegistrationGateConfig / PreprocessConfig),
+# so loading this file changes nothing until a value is edited.
+# (ndt14_baseline.yaml is NOT config: it holds only the NDT-14 replay-harness
+# regression bounds.)
 /**:
   ros__parameters:
     # Preprocessing (NDT-03 PreprocessConfig)
@@ -36,9 +36,8 @@
     gate_min_hessian_eigenvalue: 0.001
     gate_max_condition_number: 10000.0
 
-    # Input-side scan quality gate (NDT-04 QualityConfig). Flat keys (quality_*) to
-    # match the convention above. Nothing reads these yet -- the QualityChecker is
-    # wired into the pipeline at NDT-13 -- so they only stage the knobs for then.
+    # Input-side scan quality gate (NDT-04 QualityConfig), read by
+    # ndt_frontend_node. Flat keys (quality_*) to match the convention above.
     quality_min_points: 100               # reject scans sparser than this
     quality_min_spread_eigenvalue: 0.1    # m^2, smallest PCA eigenvalue floor
 
@@ -52,6 +51,14 @@
     min_translation_m: 0.3                # keyframe trigger: translation since last KF
     min_rotation_deg: 5.0                 # keyframe trigger: rotation since last KF
     publish_debug_clouds: true            # ~/scan_raw + ~/scan_target debug topics
+
+    # SLAM-01 keyframe policy (graph_backend_node). OR semantics: a keyframe is
+    # due when ANY criterion is met; a non-positive value DISABLES a criterion.
+    # Previously launch arguments on graph_backend.launch.py; centralised here so
+    # every knob lives in one file.
+    keyframe_translation_m: 0.5       # m, distance since last keyframe
+    keyframe_rotation_rad: 0.5        # rad, geodesic angle since last keyframe
+    keyframe_time_s: 10.0             # s, elapsed since last keyframe
 
     # SLAM-09 loop-closure candidate finder (graph_backend_node). Detection only;
     # SLAM-10 will verify candidates with NDT before adding a BetweenFactor. Tune
