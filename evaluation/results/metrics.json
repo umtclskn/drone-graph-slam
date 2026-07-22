@@ -1,0 +1,79 @@
+{
+  "systems": {
+    "ours_graph_slam": {
+      "run": {
+        "est": "/home/umut/portfolio_ws/drone_ws/analysis/slam_eval/ours_est.tum",
+        "gt": "/home/umut/portfolio_ws/drone_ws/analysis/slam_eval/gt.tum",
+        "cov": "/home/umut/portfolio_ws/drone_ws/analysis/slam_eval/ours_est_cov.txt",
+        "align": "se3",
+        "max_dt": 0.02,
+        "cov_scale": 1.0,
+        "nees_align": "none",
+        "rpe_deltas": [
+          1.0,
+          2.0,
+          5.0,
+          10.0
+        ]
+      },
+      "association": {
+        "matched": 112,
+        "dropped": 0,
+        "max_gap_s": 0.0
+      },
+      "ate": {
+        "align": "se3",
+        "scale": 1.0,
+        "trans_rmse_m": 0.5126819349697396,
+        "trans_mean_m": 0.4596357980509663,
+        "trans_median_m": 0.41050829282875845,
+        "trans_max_m": 0.9612074357566436,
+        "rot_rmse_deg": 5.272269118698651,
+        "count": 112
+      },
+      "rpe": {
+        "1": {
+          "delta_s": 1.0,
+          "trans_rmse_m": 0.6214984779320637,
+          "rot_rmse_deg": 1.4325659340154926,
+          "drift_per_m": 0.15370886978405163,
+          "count": 110
+        },
+        "2": {
+          "delta_s": 2.0,
+          "trans_rmse_m": 0.9438944298688631,
+          "rot_rmse_deg": 1.5377595308757637,
+          "drift_per_m": 0.12335994611465953,
+          "count": 108
+        },
+        "5": {
+          "delta_s": 5.0,
+          "trans_rmse_m": 1.5236950734234598,
+          "rot_rmse_deg": 2.2694638876481683,
+          "drift_per_m": 0.07428335262761869,
+          "count": 93
+        },
+        "10": {
+          "delta_s": 10.0,
+          "trans_rmse_m": 0.7823216099522892,
+          "rot_rmse_deg": 2.792078093076922,
+          "drift_per_m": 0.02993184981605498,
+          "count": 61
+        }
+      },
+      "nees": {
+        "dof": 3,
+        "cov_scale": 1.0,
+        "count": 112,
+        "n_skipped_pd": 0,
+        "anees": 14.558403941455468,
+        "median": 3.688446582021683,
+        "std": 109.12525428454177,
+        "coverage_95_pct": 85.71428571428571,
+        "anees_lo": 2.5634744185933918,
+        "anees_hi": 3.4703300988321217,
+        "verdict": "overconfident"
+      }
+    }
+  }
+}
