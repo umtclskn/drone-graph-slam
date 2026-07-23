@@ -29,6 +29,7 @@ setup(
             'imu_bridge = px4_offboard.imu_bridge:main',
             'imu_bridge_liosam = px4_offboard.imu_bridge_liosam:main',
             'ground_truth_bridge = px4_offboard.ground_truth_bridge:main',
+            'gazebo_truth_bridge = px4_offboard.gazebo_truth_bridge:main',
             'ekf2_odometry_adapter = px4_offboard.ekf2_odometry_adapter:main',
         ],
     },

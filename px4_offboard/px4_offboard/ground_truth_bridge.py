@@ -6,8 +6,12 @@ touching px4_msgs (the boundary rule from ARCHITECTURE.md sec 3/11). Every
 NED->ENU conversion happens here, via px4_offboard.ned_to_enu.
 
 Ground-truth source: /fmu/out/vehicle_odometry (px4_msgs/VehicleOdometry).
-The recorded bag carries no Gazebo model-state topic, so this EKF2-fused
-odometry is the available truth proxy (see the EVAL-01 story log).
+This is EKF2 *output*, not absolute simulator truth -- and the NDT-08 prior
+derives from the same source, so metrics computed against it measure
+consistency with EKF2, not accuracy. Kept for replaying pre-EVAL-06 bags
+(slam_loop_01/02), which carry no Gazebo model-state topic. For independent
+truth use gazebo_truth_bridge.py (EVAL-06); both publish /ground_truth/pose,
+so run exactly one of them.
 
 Stamp domain: PX4 message timestamps are wall-clock microseconds, a different
 clock from the sim-time LiDAR scans (verified on slam_loop_02: PX4 ts ~1.78e9 s
@@ -35,7 +39,9 @@ from px4_offboard.ned_to_enu import (
 )
 
 MAP_FRAME = 'map'
-BASE_FRAME = 'base_link'
+# Not 'base_link': the NDT front-end broadcasts odom->base_link, and a second
+# parent for the same frame breaks any TF consumer (EVAL-06 AC4).
+GT_BASE_FRAME = 'base_link_gt'
 
 
 class GroundTruthBridge(Node):
@@ -59,7 +65,7 @@ class GroundTruthBridge(Node):
         self.warned_frame = False
         self.get_logger().info(
             'ground_truth_bridge up: /fmu/out/vehicle_odometry (NED) -> '
-            '/ground_truth/pose + /ground_truth/odom + TF map->base_link')
+            f'/ground_truth/pose + /ground_truth/odom + TF map->{GT_BASE_FRAME}')
 
     def callback(self, msg: VehicleOdometry):
         if msg.pose_frame != VehicleOdometry.POSE_FRAME_NED:
@@ -97,7 +103,7 @@ class GroundTruthBridge(Node):
         odom = Odometry()
         odom.header.stamp = stamp
         odom.header.frame_id = MAP_FRAME
-        odom.child_frame_id = BASE_FRAME
+        odom.child_frame_id = GT_BASE_FRAME
         odom.pose.pose = pose.pose
         # Variances are per-axis; the axis swap just relabels them (signs do
         # not affect variance). Order in ROS covariance is x, y, z, rx, ry, rz.
@@ -128,7 +134,7 @@ class GroundTruthBridge(Node):
         tf = TransformStamped()
         tf.header.stamp = stamp
         tf.header.frame_id = MAP_FRAME
-        tf.child_frame_id = BASE_FRAME
+        tf.child_frame_id = GT_BASE_FRAME
         tf.transform.translation.x = px
         tf.transform.translation.y = py
         tf.transform.translation.z = pz

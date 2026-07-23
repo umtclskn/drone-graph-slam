@@ -28,6 +28,19 @@ def _trajectory(tum: np.ndarray) -> Trajectory:
     return Trajectory(stamps=tum[:, 0], pos=tum[:, 1:4], rot=quats_to_rots(tum[:, 4:8]))
 
 
+def _file_header(path: str) -> str | None:
+    """The leading `#` comment of a TUM file — the exporters' provenance note,
+    reused as the default ground-truth label so no new plumbing is needed."""
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("#"):
+                return line.lstrip("#").strip() or None
+            if line:
+                return None
+    return None
+
+
 def main() -> int:
     p = argparse.ArgumentParser(prog="slam_eval", description=__doc__)
     p.add_argument("--est", required=True, help="estimated trajectory (TUM)")
@@ -38,6 +51,13 @@ def main() -> int:
     p.add_argument("--out", required=True, help="output directory (shared analysis folder)")
     p.add_argument("--name", default=None,
                    help="system name = table row label (default: est filename stem)")
+    p.add_argument("--gt_label", default=None,
+                   help="ground-truth provenance for THIS row, e.g. 'Gazebo model-state "
+                        "(independent)' or 'PX4 EKF2'. Default: the '#' header line of "
+                        "--gt. Reported per row — rows may legitimately differ")
+    p.add_argument("--bag", default=None,
+                   help="source bag for THIS row, e.g. bags/slam_loop_03 (default: "
+                        "unspecified). Reported per row — rows may legitimately differ")
     p.add_argument("--align", choices=["se3", "first", "sim3"], default="se3",
                    help="trajectory alignment for ATE (default se3 = Umeyama, no scale; "
                         "'first' reproduces the in-repo C++ first-pose ATE; sim3 flatters "
@@ -137,6 +157,8 @@ def main() -> int:
             "est": os.path.abspath(args.est),
             "gt": os.path.abspath(args.gt),
             "cov": os.path.abspath(args.cov) if args.cov else None,
+            "bag": args.bag,
+            "gt_label": args.gt_label or _file_header(args.gt),
             "align": args.align,
             "max_dt": args.max_dt,
             "cov_scale": args.cov_scale,

@@ -66,8 +66,11 @@ def main() -> int:
     src = f"exported from {args.csv} (keyframe rows only)"
     write_tum(os.path.join(args.out, "ours_est.tum"), np.array(est_rows),
               f"graph_slam optimized keyframe trajectory — {src}")
+    # Provenance is whichever bridge fed /ground_truth/pose during the run:
+    # px4_offboard's ground_truth_bridge (PX4 EKF2 output, pre-EVAL-06 bags) or
+    # gazebo_truth_bridge (independent Gazebo model state, EVAL-06 onward).
     write_tum(os.path.join(args.out, "gt.tum"), np.array(gt_rows),
-              f"ground truth (PX4 EKF2 bridge, NOT independent Gazebo truth) — {src}")
+              f"ground truth as logged by graph_backend_node — {src}")
     write_cov(os.path.join(args.out, "ours_est_cov.txt"), np.array(stamps), np.array(covs),
               "Sigma_post, upper-tri 6x6, contract order [x y z roll pitch yaw], "
               f"reordered from GTSAM [rx ry rz x y z] — {src}")
