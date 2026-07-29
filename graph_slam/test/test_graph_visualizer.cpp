@@ -29,6 +29,16 @@ gtsam::Matrix66 identitySigma(double scale) {
   return gtsam::Matrix66::Identity() * scale;
 }
 
+// L5-02: bootstrap seeds X(0)/V(0)/B(0) with three priors; ingest wholesale.
+void bootstrapInto(GraphOptimizer& optimizer, const gtsam::Pose3& x0_pose,
+                   const gtsam::SharedNoiseModel& pose_noise) {
+  const GraphBootstrap bootstrap;
+  const auto boot = bootstrap.create(x0_pose, pose_noise,
+                                     gtsam::noiseModel::Isotropic::Sigma(3, 10.0),
+                                     gtsam::noiseModel::Isotropic::Sigma(6, 0.1));
+  optimizer.add_factors(boot.graph, boot.values);
+}
+
 GraphVisualization vizFromOptimizer(const GraphOptimizer& optimizer) {
   return GraphVisualizer::fromEstimate(optimizer.estimate());
 }
@@ -42,15 +52,9 @@ TEST(GraphVisualizerTest, EmptyGraph) {
 
 TEST(GraphVisualizerTest, SingleNode) {
   GraphOptimizer optimizer;
-  const GraphBootstrap bootstrap;
   const gtsam::Pose3 x0_pose(gtsam::Rot3(), gtsam::Point3(1.0, 2.0, 3.0));
   const auto noise = diagonalNoise(gtsam::Vector6::Constant(0.01));
-  const auto boot = bootstrap.create(x0_pose, noise);
-  const gtsam::Key x0 = gtsam::Symbol('x', 0);
-  const auto* prior =
-      dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(boot.graph.at(0).get());
-  ASSERT_NE(prior, nullptr);
-  optimizer.add_prior(*prior, x0, boot.values.at<gtsam::Pose3>(x0));
+  bootstrapInto(optimizer, x0_pose, noise);
   optimizer.update();
 
   const GraphVisualization viz = vizFromOptimizer(optimizer);
@@ -61,7 +65,6 @@ TEST(GraphVisualizerTest, SingleNode) {
 
 TEST(GraphVisualizerTest, MultipleNodes) {
   GraphOptimizer optimizer;
-  const GraphBootstrap bootstrap;
   const OdometryFactorBuilder factor_builder;
   const auto noise = diagonalNoise(gtsam::Vector6::Constant(0.01));
   const auto sigma = identitySigma(0.01);
@@ -70,11 +73,7 @@ TEST(GraphVisualizerTest, MultipleNodes) {
   const gtsam::Key x2 = gtsam::Symbol('x', 2);
 
   const gtsam::Pose3 x0_pose;
-  const auto boot = bootstrap.create(x0_pose, noise);
-  const auto* prior =
-      dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(boot.graph.at(0).get());
-  ASSERT_NE(prior, nullptr);
-  optimizer.add_prior(*prior, x0, boot.values.at<gtsam::Pose3>(x0));
+  bootstrapInto(optimizer, x0_pose, noise);
   optimizer.update();
 
   const gtsam::Pose3 delta01(gtsam::Rot3(), gtsam::Point3(1.0, 0.0, 0.0));
@@ -94,7 +93,6 @@ TEST(GraphVisualizerTest, MultipleNodes) {
 
 TEST(GraphVisualizerTest, PathSizeEqualsNodeCount) {
   GraphOptimizer optimizer;
-  const GraphBootstrap bootstrap;
   const OdometryFactorBuilder factor_builder;
   const auto noise = diagonalNoise(gtsam::Vector6::Constant(0.01));
   const auto sigma = identitySigma(0.01);
@@ -102,11 +100,7 @@ TEST(GraphVisualizerTest, PathSizeEqualsNodeCount) {
   const gtsam::Key x1 = gtsam::Symbol('x', 1);
 
   const gtsam::Pose3 x0_pose;
-  const auto boot = bootstrap.create(x0_pose, noise);
-  const auto* prior =
-      dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(boot.graph.at(0).get());
-  ASSERT_NE(prior, nullptr);
-  optimizer.add_prior(*prior, x0, boot.values.at<gtsam::Pose3>(x0));
+  bootstrapInto(optimizer, x0_pose, noise);
   optimizer.update();
 
   const gtsam::Pose3 delta(gtsam::Rot3(), gtsam::Point3(0.5, 0.0, 0.0));
@@ -120,18 +114,12 @@ TEST(GraphVisualizerTest, PathSizeEqualsNodeCount) {
 
 TEST(GraphVisualizerTest, MarkerCountEqualsNodeCount) {
   GraphOptimizer optimizer;
-  const GraphBootstrap bootstrap;
   const OdometryFactorBuilder factor_builder;
   const auto noise = diagonalNoise(gtsam::Vector6::Constant(0.01));
   const auto sigma = identitySigma(0.01);
 
   const gtsam::Pose3 x0_pose;
-  const auto boot = bootstrap.create(x0_pose, noise);
-  const auto* prior =
-      dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(boot.graph.at(0).get());
-  ASSERT_NE(prior, nullptr);
-  const gtsam::Key x0 = gtsam::Symbol('x', 0);
-  optimizer.add_prior(*prior, x0, boot.values.at<gtsam::Pose3>(x0));
+  bootstrapInto(optimizer, x0_pose, noise);
   optimizer.update();
 
   for (std::size_t i = 1; i <= 4; ++i) {
@@ -152,18 +140,12 @@ TEST(GraphVisualizerTest, MarkerCountEqualsNodeCount) {
 
 TEST(GraphVisualizerTest, OdometryEdgeCount) {
   GraphOptimizer optimizer;
-  const GraphBootstrap bootstrap;
   const OdometryFactorBuilder factor_builder;
   const auto noise = diagonalNoise(gtsam::Vector6::Constant(0.01));
   const auto sigma = identitySigma(0.01);
 
   const gtsam::Pose3 x0_pose;
-  const auto boot = bootstrap.create(x0_pose, noise);
-  const auto* prior =
-      dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(boot.graph.at(0).get());
-  ASSERT_NE(prior, nullptr);
-  const gtsam::Key x0 = gtsam::Symbol('x', 0);
-  optimizer.add_prior(*prior, x0, boot.values.at<gtsam::Pose3>(x0));
+  bootstrapInto(optimizer, x0_pose, noise);
   optimizer.update();
 
   EXPECT_EQ(vizFromOptimizer(optimizer).odometryEdgeCount(), 0U);

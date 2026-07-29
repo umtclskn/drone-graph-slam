@@ -202,15 +202,12 @@ class GraphVisualizerNode : public rclcpp::Node {
 
     if (self_test_step_ == 0) {
       const gtsam::Pose3 x0_pose;
-      const auto boot = bootstrap.create(x0_pose, noise);
-      const auto* prior = dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(
-          boot.graph.at(0).get());
-      if (prior == nullptr) {
-        RCLCPP_ERROR(get_logger(), "self_test bootstrap failed.");
-        return;
-      }
-      const gtsam::Key x0 = gtsam::Symbol('x', 0);
-      optimizer_->add_prior(*prior, x0, boot.values.at<gtsam::Pose3>(x0));
+      // L5-02 bootstrap seeds X(0)/V(0)/B(0); the self-test only draws poses,
+      // so weak velocity/bias prior noises suffice here.
+      const auto boot = bootstrap.create(
+          x0_pose, noise, gtsam::noiseModel::Isotropic::Sigma(3, 10.0),
+          gtsam::noiseModel::Isotropic::Sigma(6, 0.1));
+      optimizer_->add_factors(boot.graph, boot.values);
       optimizer_->update();
     } else {
       const std::size_t prev = static_cast<std::size_t>(self_test_step_ - 1);

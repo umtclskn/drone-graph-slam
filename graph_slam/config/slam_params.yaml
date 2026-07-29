@@ -26,6 +26,13 @@
     # right SHAPE but wrong SCALE, so Sigma_meas is ~435x overconfident. This scalar
     # multiplies the Hessian-based Sigma_meas (front-end odometry AND loop edges).
     # In-code default is 1.0; alpha = mean_NEES/dim = 1306/3 = 435 on slam_loop_02.
+    # L5-05 (2026-07-28): 435 is UN-VALIDATED on the L5 LiDAR-inertial backbone and
+    # deliberately NOT re-fit here. Re-run on slam_loop_03 gave median NEES ~28
+    # (overconfident) -- but the overconfidence is now from the ImuFactor's stock
+    # covariance, not the NDT scale (NDT-only with this same 435 is consistent),
+    # so a scalar on Sigma_meas cannot fix it. See analysis/slam_eval_loop03/
+    # COMPARISON.md 2.6 + analysis/nees_report_l5_loop03.txt; real fix = the
+    # deferred joint IMU-noise/NDT-scale calibration story.
     ndt_cov_scale_factor: 435.0      # Sigma_meas = cov_scale_factor * lambda * H^-1
     ndt_sigma_rot_fallback: 0.01     # rad, fallback rotation std (degenerate H)
     ndt_sigma_t_fallback: 0.1        # m,   fallback translation std (degenerate H)
@@ -75,6 +82,50 @@
     loop_min_ndt_score: -0.8             # accept only if NDT fitness <= this (lower = better)
     loop_min_sigma_eigenvalue: 0.000001  # reject if worst Hessian eigenvalue below this
     loop_max_condition_number: 10000.0   # reject if Hessian condition number above this
+
+    # L5-01 IMU preintegration (graph_backend_node). IMU enters graph_slam as
+    # sensor_msgs/Imu from px4_offboard/imu_bridge.py (FLU base_link, ENU-consistent).
+    # The backend RE-STAMPS each sample with its own clock (sim time under
+    # use_sim_time) because imu_bridge.py forwards PX4 wall-clock stamps, which can't
+    # be windowed against the sim-time keyframes/GT (bag-replay-clock-domain). Noise
+    # sigma = LIO-SAM params_drone_x500.yaml (tuned for this x500 sim bag → keeps the
+    # ours-vs-LIO-SAM comparison fair). Gravity is ENU: MakeSharedU → n_g=(0,0,-g).
+    # The bias-random-walk sigmas are stored for L5-03/04's BetweenFactor<imuBias>;
+    # they are NOT part of the plain-ImuFactor PreintegrationParams.
+    imu_topic: "/imu/data"                            # sensor_msgs/Imu (ENU/FLU base_link)
+    imu_buffer_seconds: 5.0                           # bounded IMU sample buffer horizon
+    imu_accel_noise_sigma: 0.0039939570888238808      # m/s^2/sqrt(Hz)
+    imu_gyro_noise_sigma: 0.0015636343949698187       # rad/s/sqrt(Hz)
+    imu_accel_bias_rw_sigma: 0.000064356659353532566  # m/s^3/sqrt(Hz)  (L5-03 bias factor)
+    imu_gyro_bias_rw_sigma: 0.000035640318696367613   # rad/s^2/sqrt(Hz)(L5-03 bias factor)
+    imu_integration_sigma: 0.001                      # integration uncertainty
+    imu_gravity: 9.8                                  # |g| [m/s^2], ENU -> (0,0,-g)
+    # L5-01e validation: preintegrate rolling ~1 s windows and log drift vs Gazebo GT
+    # + covariance-trace growth. OFF in production; enable for the bag-validation run.
+    imu_diagnostic_enabled: false
+    imu_diagnostic_window_s: 1.0
+    # L5-03 IMU backbone factor injection (graph_backend_node). On every keyframe the
+    # back-end adds an ImuFactor(X_i,V_i,X_j,V_j,B_i,preint) + a separate
+    # BetweenFactor<imuBias>(B_i,B_j, zero, sqrt(dt)*[accBiasRW,gyrBiasRW]) — LIO-SAM
+    # style, NOT CombinedImuFactor — alongside the independent NDT BetweenFactor<Pose3>.
+    # The two ablation toggles below default true (full LiDAR-inertial backbone):
+    #   imu_factor_enabled=false → NDT-only (pre-L5-03 path: NDT edge + weak V/B priors)
+    #   ndt_factor_enabled=false → IMU-only (drop the NDT edge; node held by ImuFactor)
+    imu_factor_enabled: true
+    ndt_factor_enabled: true
+
+    # L5-04 bootstrap priors (graph_backend_node): sigmas of the X(0)/V(0)/B(0)
+    # PriorFactors created at the first NDT-odom message. Pose is tight at that
+    # first NDT-odom pose (never EKF2). Velocity is near zero because the
+    # canonical bags bootstrap pre-takeoff at rest (GT-verified on slam_loop_03)
+    # — widen bootstrap_velocity_sigma if a bag ever bootstraps mid-flight. The
+    # bias prior is zero-mean with separate accel/gyro sigmas sized to admit the
+    # ~0.036 m/s^2 accel bias the optimizer settles at on slam_loop_03 (L5-03);
+    # LIO-SAM's priorBiasNoise sigma 1e-3 would fight that at ~36 sigma.
+    bootstrap_pose_sigma: 0.001        # rad & m, all 6 dof of the X(0) prior
+    bootstrap_velocity_sigma: 0.1      # m/s, V(0) prior (at-rest bootstrap)
+    bootstrap_accel_bias_sigma: 0.1    # m/s^2, accel block of the B(0) prior
+    bootstrap_gyro_bias_sigma: 0.01    # rad/s, gyro block of the B(0) prior
 
     # INFRA-01: static base_link -> lidar_link mount offset (launch file reads these).
     # Identity = lidar at base_link origin. Keys name the lidar-in-base offset; the

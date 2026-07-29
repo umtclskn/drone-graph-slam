@@ -32,9 +32,11 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <string>
@@ -50,6 +52,7 @@
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <tf2_ros/transform_broadcaster.h>
@@ -58,6 +61,7 @@
 
 #include "graph_slam/eval/graph_visualizer.hpp"
 #include "graph_slam/graph/graph_bootstrap.hpp"
+#include "graph_slam/imu/imu_preintegrator.hpp"
 #include "graph_slam/graph/graph_optimizer.hpp"
 #include "graph_slam/graph/keyframe_policy.hpp"
 #include "graph_slam/graph/odometry_accumulator.hpp"
@@ -68,6 +72,11 @@
 
 namespace graph_slam {
 namespace {
+
+// L5-02 node model: every keyframe i carries X(i) pose, V(i) velocity, B(i)
+// IMU bias. X(i) is byte-identical to the old Symbol('x', i), so pose keys
+// (and every consumer that walks them) are unchanged.
+namespace sym = gtsam::symbol_shorthand;
 
 // ---------------------------------------------------------------------------
 // Type conversion helpers
@@ -384,6 +393,68 @@ class GraphBackendNode : public rclcpp::Node {
         declare_parameter<std::string>("ground_truth_topic", "/ground_truth/pose");
     latest_gt_.pose.orientation.w = 1.0;  // valid identity quat until first GT msg
 
+    // L5-01: IMU intake + preintegration params. The wrapper is ROS-free; the node
+    // owns the subscription, the sim-time re-stamp, and the bounded buffer.
+    imu_topic_ = declare_parameter<std::string>("imu_topic", "/imu/data");
+    imu_buffer_seconds_ = declare_parameter<double>("imu_buffer_seconds", 5.0);
+    preint_config_.accel_noise_sigma = declare_parameter<double>(
+        "imu_accel_noise_sigma", preint_config_.accel_noise_sigma);
+    preint_config_.gyro_noise_sigma = declare_parameter<double>(
+        "imu_gyro_noise_sigma", preint_config_.gyro_noise_sigma);
+    preint_config_.accel_bias_rw_sigma = declare_parameter<double>(
+        "imu_accel_bias_rw_sigma", preint_config_.accel_bias_rw_sigma);
+    preint_config_.gyro_bias_rw_sigma = declare_parameter<double>(
+        "imu_gyro_bias_rw_sigma", preint_config_.gyro_bias_rw_sigma);
+    preint_config_.integration_sigma = declare_parameter<double>(
+        "imu_integration_sigma", preint_config_.integration_sigma);
+    preint_config_.gravity =
+        declare_parameter<double>("imu_gravity", preint_config_.gravity);
+    // L5-01e: rolling ~1 s preintegration-vs-GT self-check (off in production).
+    imu_diagnostic_enabled_ = declare_parameter<bool>("imu_diagnostic_enabled", false);
+    imu_diagnostic_window_s_ = declare_parameter<double>("imu_diagnostic_window_s", 1.0);
+    // L5-03 ablation toggles (both default true = full LiDAR-inertial backbone).
+    //   imu_factor_enabled=false → pre-L5-03 path (NDT edge + weak V/B scaffolding
+    //     priors) = NDT-only, reproduces L5-02/pre-L5.
+    //   ndt_factor_enabled=false → IMU-only (drop the NDT BetweenFactor; node j held
+    //     by the ImuFactor alone; requires IMU present in each interval).
+    imu_factor_enabled_ = declare_parameter<bool>("imu_factor_enabled", true);
+    ndt_factor_enabled_ = declare_parameter<bool>("ndt_factor_enabled", true);
+    // L5-03: build the persistent preintegrator from the (now fully-populated)
+    // config; it is reset at the bootstrap keyframe and after every keyframe.
+    preint_.emplace(preint_config_);
+
+    // L5-02 scaffolding prior noise for the per-node V(i)/B(i) values (weak,
+    // held at zero; see addVelocityBiasScaffolding). Deliberately weak and
+    // SEPARATE from the L5-04 bootstrap priors: they only hold otherwise-
+    // factorless variables on the NDT-only / no-IMU path without moving the
+    // pose solution (L5-02e's byte-identical guarantee).
+    scaffold_velocity_noise_ = gtsam::noiseModel::Isotropic::Sigma(3, 10.0);
+    scaffold_bias_noise_ = gtsam::noiseModel::Isotropic::Sigma(6, 0.1);
+
+    // L5-04 bootstrap priors: the sigmas for the X(0)/V(0)/B(0) PriorFactors.
+    // Pose: tight, at the first NDT-odom pose — explicitly NOT EKF2. Velocity:
+    // near zero — the canonical bags bootstrap pre-takeoff at rest (verified on
+    // slam_loop_03); widen if a bag ever bootstraps mid-flight. Bias: zero-mean
+    // with separate accel/gyro sigmas, wide enough to admit the ~0.036 m/s^2
+    // accel bias the optimizer settles at on slam_loop_03 (L5-03 journal) —
+    // LIO-SAM's priorBiasNoise sigma 1e-3 would fight that at ~36 sigma.
+    bootstrap_pose_sigma_ = declare_parameter<double>("bootstrap_pose_sigma", 0.001);
+    bootstrap_velocity_sigma_ =
+        declare_parameter<double>("bootstrap_velocity_sigma", 0.1);
+    bootstrap_accel_bias_sigma_ =
+        declare_parameter<double>("bootstrap_accel_bias_sigma", 0.1);
+    bootstrap_gyro_bias_sigma_ =
+        declare_parameter<double>("bootstrap_gyro_bias_sigma", 0.01);
+    bootstrap_pose_noise_ = gtsam::noiseModel::Diagonal::Sigmas(
+        gtsam::Vector6::Constant(bootstrap_pose_sigma_));
+    bootstrap_velocity_noise_ =
+        gtsam::noiseModel::Isotropic::Sigma(3, bootstrap_velocity_sigma_);
+    gtsam::Vector6 bias_sigmas;  // ConstantBias tangent order: accel, then gyro
+    bias_sigmas << bootstrap_accel_bias_sigma_, bootstrap_accel_bias_sigma_,
+        bootstrap_accel_bias_sigma_, bootstrap_gyro_bias_sigma_,
+        bootstrap_gyro_bias_sigma_, bootstrap_gyro_bias_sigma_;
+    bootstrap_bias_noise_ = gtsam::noiseModel::Diagonal::Sigmas(bias_sigmas);
+
     const double kf_dist = declare_parameter<double>("keyframe_translation_m", 0.5);
     const double kf_angle = declare_parameter<double>("keyframe_rotation_rad", 0.5);
     const double kf_time = declare_parameter<double>("keyframe_time_s", 10.0);
@@ -445,6 +516,10 @@ class GraphBackendNode : public rclcpp::Node {
     gt_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
         gt_topic_, rclcpp::QoS(50),
         [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) { onGroundTruth(msg); });
+    // L5-01: raw IMU (sensor_msgs/Imu from px4_offboard/imu_bridge.py, ENU/FLU).
+    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
+        imu_topic_, rclcpp::SensorDataQoS(),
+        [this](sensor_msgs::msg::Imu::ConstSharedPtr msg) { onImu(msg); });
 
     RCLCPP_INFO(get_logger(),
                 "graph_backend up. Subscribing to '%s'. KF thresholds: %.2f m / %.2f rad / "
@@ -455,6 +530,15 @@ class GraphBackendNode : public rclcpp::Node {
   }
 
  private:
+  // L5-01: a node-clock-stamped GT pose sample, used only by the L5-01e diagnostic
+  // (NavState seed + finite-difference velocity). Declared before the methods whose
+  // signatures reference it.
+  struct GtSample {
+    double stamp_s{0.0};
+    Eigen::Vector3d position{Eigen::Vector3d::Zero()};
+    gtsam::Rot3 rotation;
+  };
+
   // Keep the latest preprocessed scan so the next keyframe can snapshot it for
   // loop-closure verification (SLAM-10).
   void onScan(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
@@ -472,6 +556,162 @@ class GraphBackendNode : public rclcpp::Node {
     geometry_msgs::msg::PoseStamped ps = *msg;
     ps.header.frame_id = map_frame_;
     gt_path_.poses.push_back(ps);
+
+    // L5-01e: keep a short GT pose history for the IMU-diagnostic NavState seed.
+    // Re-stamp with the node clock (sim time under use_sim_time) so it shares the
+    // exact clock domain as the re-stamped IMU buffer (bag-replay-clock-domain).
+    if (imu_diagnostic_enabled_) {
+      GtSample g;
+      g.stamp_s = now().seconds();
+      g.position = Eigen::Vector3d(msg->pose.position.x, msg->pose.position.y,
+                                   msg->pose.position.z);
+      g.rotation = gtsam::Rot3::Quaternion(msg->pose.orientation.w, msg->pose.orientation.x,
+                                           msg->pose.orientation.y, msg->pose.orientation.z);
+      gt_history_.push_back(g);
+      while (!gt_history_.empty() &&
+             (g.stamp_s - gt_history_.front().stamp_s) > imu_buffer_seconds_) {
+        gt_history_.pop_front();
+      }
+    }
+  }
+
+  // L5-01a: buffer one IMU sample, re-stamped into the SLAM sim-time clock (the
+  // imu_bridge forwards PX4 wall-clock stamps, which cannot be windowed against
+  // sim-time keyframes/GT — see bag-replay-clock-domain). Prune to the horizon.
+  void onImu(const sensor_msgs::msg::Imu::ConstSharedPtr& msg) {
+    imu::ImuSample s;
+    s.stamp_s = now().seconds();
+    s.accel = Eigen::Vector3d(msg->linear_acceleration.x, msg->linear_acceleration.y,
+                              msg->linear_acceleration.z);
+    s.gyro = Eigen::Vector3d(msg->angular_velocity.x, msg->angular_velocity.y,
+                             msg->angular_velocity.z);
+    imu_buffer_.push_back(s);
+    while (!imu_buffer_.empty() &&
+           (s.stamp_s - imu_buffer_.front().stamp_s) > imu_buffer_seconds_) {
+      imu_buffer_.pop_front();
+    }
+
+    // L5-03: fold each sample into the persistent preintegrator once the graph is
+    // bootstrapped. dt is the gap to the previous re-stamped sample; the dt<=0
+    // guard in ImuPreintegrator drops the ~0.4 % duplicate sim-time stamps. The
+    // stamp is kept continuous across keyframes (the PIM accumulation, not the
+    // clock, is what reset() clears), so no interval time is lost at a boundary.
+    if (bootstrapped_ && preint_ && imu_factor_enabled_) {
+      if (last_imu_stamp_ >= 0.0) {
+        preint_->integrate(s.accel, s.gyro, s.stamp_s - last_imu_stamp_);
+      }
+      last_imu_stamp_ = s.stamp_s;
+    }
+
+    if (imu_diagnostic_enabled_) {
+      maybeRunImuDiagnostic(s.stamp_s);
+    }
+  }
+
+  // L5-01e: once ~imu_diagnostic_window_s of IMU has elapsed, preintegrate that
+  // window and report drift vs the independent Gazebo GT + covariance growth.
+  void maybeRunImuDiagnostic(double t_now) {
+    if (diag_window_start_t_ < 0.0) {
+      diag_window_start_t_ = t_now;  // open the first window
+      return;
+    }
+    if (t_now - diag_window_start_t_ < imu_diagnostic_window_s_) {
+      return;
+    }
+    runImuDiagnostic(diag_window_start_t_, t_now);
+    diag_window_start_t_ = t_now;  // slide the window
+  }
+
+  // Nearest GT sample to time t (within a 0.15 s tolerance, else none).
+  std::optional<GtSample> gtNearest(double t) const {
+    std::optional<GtSample> best;
+    double best_dt = 0.15;
+    for (const GtSample& g : gt_history_) {
+      const double dt = std::abs(g.stamp_s - t);
+      if (dt < best_dt) {
+        best_dt = dt;
+        best = g;
+      }
+    }
+    return best;
+  }
+
+  // GT nav-frame velocity at time t by central difference of the position history
+  // over a ~0.1 s baseline (the /ground_truth/odom twist is empty — pose-only
+  // bridge). A fixed baseline is robust to the per-sample jitter that the
+  // node-clock re-stamp adds; zero if history does not cover t±h.
+  Eigen::Vector3d gtVelocity(double t) const {
+    constexpr double h = 0.05;  // half-baseline [s]
+    const std::optional<GtSample> a = gtNearest(t - h);
+    const std::optional<GtSample> b = gtNearest(t + h);
+    if (a && b && b->stamp_s > a->stamp_s) {
+      return (b->position - a->position) / (b->stamp_s - a->stamp_s);
+    }
+    return Eigen::Vector3d::Zero();
+  }
+
+  // Preintegrate the buffered IMU over [win_start, win_end], predict from the GT
+  // NavState at win_start, and log position/rotation error vs GT at win_end plus
+  // the covariance-trace growth (mid-window vs end). Validates gravity sign, frame,
+  // and noise before any IMU factor is added (L5-03).
+  void runImuDiagnostic(double win_start, double win_end) {
+    const std::optional<GtSample> gt_i = gtNearest(win_start);
+    const std::optional<GtSample> gt_j = gtNearest(win_end);
+    if (!gt_i || !gt_j) {
+      return;  // no GT coverage for this window yet
+    }
+
+    imu::ImuPreintegrator preint(preint_config_);
+    std::size_t n = 0;
+    std::size_t half = 0;
+    double cov_trace_mid = 0.0;
+    // First count how many samples fall in the window (for the mid-window capture).
+    std::size_t in_window = 0;
+    for (const imu::ImuSample& s : imu_buffer_) {
+      if (s.stamp_s >= win_start && s.stamp_s <= win_end) {
+        ++in_window;
+      }
+    }
+    half = in_window / 2;
+
+    bool have_prev = false;
+    double prev_t = win_start;
+    for (const imu::ImuSample& s : imu_buffer_) {
+      if (s.stamp_s < win_start || s.stamp_s > win_end) {
+        continue;
+      }
+      if (have_prev) {
+        preint.integrate(s.accel, s.gyro, s.stamp_s - prev_t);
+      }
+      prev_t = s.stamp_s;
+      have_prev = true;
+      ++n;
+      if (n == half && preint.count() > 0) {
+        cov_trace_mid = preint.covariance().trace();
+      }
+    }
+    if (preint.count() == 0) {
+      return;
+    }
+
+    const Eigen::Vector3d v_i = gtVelocity(win_start);
+    const gtsam::NavState state_i(gt_i->rotation, gtsam::Point3(gt_i->position), v_i);
+    const gtsam::NavState pred = preint.predict(state_i, gtsam::imuBias::ConstantBias());
+
+    const double pos_err = (Eigen::Vector3d(pred.position()) - gt_j->position).norm();
+    const double rot_err_deg =
+        gtsam::Rot3::Logmap(pred.attitude().between(gt_j->rotation)).norm() * 180.0 / M_PI;
+    const double gt_dist = (gt_j->position - gt_i->position).norm();
+    const double gt_speed = gt_dist / std::max(win_end - win_start, 1e-6);
+    const double cov_trace_end = preint.covariance().trace();
+
+    RCLCPP_INFO(
+        get_logger(),
+        "IMU-diag [%.2f→%.2f s] n=%zu dt=%.3f | GT speed %.3f m/s (moved %.3f m), "
+        "seed |v0|=%.3f m/s | pos_err %.4f m, rot_err %.4f deg | cov_trace mid→end "
+        "%.3e→%.3e",
+        win_start, win_end, preint.count(), preint.deltaTij(), gt_speed, gt_dist,
+        v_i.norm(), pos_err, rot_err_deg, cov_trace_mid, cov_trace_end);
   }
 
   void onNdtOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
@@ -483,28 +723,41 @@ class GraphBackendNode : public rclcpp::Node {
     const gtsam::Matrix66 sigma_meas = navCovToGtsam(cov_arr);
 
     // -----------------------------------------------------------------------
-    // Bootstrap: first message → insert x0 + PriorFactor
+    // Bootstrap: first message → insert X(0)/V(0)/B(0) + their PriorFactors
+    // (L5-02 node model; L5-04 principled priors: pose tight at the first
+    // NDT-odom pose — not EKF2 — velocity near zero, bias zero-mean)
     // -----------------------------------------------------------------------
     if (!bootstrapped_) {
-      const gtsam::Key x0 = gtsam::Symbol('x', 0);
-      const auto prior_noise =
-          gtsam::noiseModel::Diagonal::Sigmas(gtsam::Vector6::Constant(0.001));
       const graph::GraphBootstrap bootstrap;
-      const auto boot = bootstrap.create(current_pose, prior_noise);
-      const auto* prior =
-          dynamic_cast<const gtsam::PriorFactor<gtsam::Pose3>*>(boot.graph.at(0).get());
-      optimizer_.add_prior(*prior, x0, boot.values.at<gtsam::Pose3>(x0));
+      const auto boot = bootstrap.create(current_pose, bootstrap_pose_noise_,
+                                         bootstrap_velocity_noise_,
+                                         bootstrap_bias_noise_);
+      optimizer_.add_factors(boot.graph, boot.values);
       optimizer_.update();
       last_pose_ = current_pose;
       last_kf_stamp_ = current_stamp;
       kf_index_ = 0;
       bootstrapped_ = true;
-      storeKeyframeCloud(x0);
+      // L5-03: start the IMU backbone at X(0) with zero bias and re-arm the sample
+      // clock, so the [X0,X1] interval integrates from here (any pre-bootstrap IMU
+      // is discarded — it precedes X0).
+      if (preint_) {
+        preint_->reset(gtsam::imuBias::ConstantBias{});
+      }
+      last_imu_stamp_ = -1.0;
+      storeKeyframeCloud(sym::X(0));
       publishAll(current_stamp);
       emitDiagnostics(current_stamp);
-      RCLCPP_INFO(get_logger(), "Graph bootstrapped at x0 (%.2f, %.2f, %.2f).",
+      // L5-04: log the full initial state + prior sigmas (clean-init evidence).
+      RCLCPP_INFO(get_logger(),
+                  "Graph bootstrapped at x0 (%.2f, %.2f, %.2f) [first NDT-odom pose, "
+                  "prior sigma %.4g] | v0 = (0, 0, 0) m/s [prior sigma %.4g m/s] | "
+                  "b0 = 0 [prior sigma accel %.4g m/s^2, gyro %.4g rad/s]; bias chain "
+                  "starts at B(0), first BetweenFactor<imuBias> lands at x1.",
                   current_pose.translation().x(), current_pose.translation().y(),
-                  current_pose.translation().z());
+                  current_pose.translation().z(), bootstrap_pose_sigma_,
+                  bootstrap_velocity_sigma_, bootstrap_accel_bias_sigma_,
+                  bootstrap_gyro_bias_sigma_);
       return;
     }
 
@@ -531,18 +784,76 @@ class GraphBackendNode : public rclcpp::Node {
     // -----------------------------------------------------------------------
     const std::size_t prev_idx = kf_index_;
     ++kf_index_;
-    const gtsam::Key x_prev = gtsam::Symbol('x', prev_idx);
-    const gtsam::Key x_cur = gtsam::Symbol('x', kf_index_);
+    const gtsam::Key x_prev = sym::X(prev_idx);
+    const gtsam::Key x_cur = sym::X(kf_index_);
 
-    const gtsam::Pose3 prev_optimized =
-        optimizer_.estimate().at<gtsam::Pose3>(x_prev);
-    const gtsam::Pose3 x_cur_init = prev_optimized.compose(acc.delta);
+    const gtsam::Values est_before = optimizer_.estimate();
+    const gtsam::Pose3 prev_pose = est_before.at<gtsam::Pose3>(x_prev);
 
+    // The NDT relative-pose measurement for this edge (always built from the
+    // accumulated scan-to-scan delta; added as an independent factor per L5-03d).
     const graph::OdometryFactorBuilder factor_builder;
-    const auto factor =
+    const gtsam::BetweenFactor<gtsam::Pose3> ndt_factor =
         factor_builder.create_factor(x_prev, x_cur, acc.delta, acc.covariance);
-    optimizer_.add_odometry(factor, x_cur, x_cur_init);
-    optimizer_.update();
+
+    // Use the IMU backbone only if enabled AND this interval actually carried IMU
+    // (count>0 ⇒ deltaTij>0). An empty interval (off-nominal) falls back to the
+    // NDT+scaffolding path so node j is never left unconstrained.
+    const bool use_imu = imu_factor_enabled_ && preint_ && preint_->count() > 0;
+    const bool add_ndt = use_imu ? ndt_factor_enabled_ : true;
+
+    if (use_imu) {
+      const gtsam::Velocity3 prev_vel =
+          est_before.at<gtsam::Velocity3>(sym::V(prev_idx));
+      const gtsam::imuBias::ConstantBias prev_bias =
+          est_before.at<gtsam::imuBias::ConstantBias>(sym::B(prev_idx));
+      const gtsam::PreintegratedImuMeasurements& pim = preint_->finish();
+
+      // Initial guesses: NDT-composed pose (best) when the NDT edge is present,
+      // else the IMU-predicted pose; IMU-predicted velocity; bias carried from i.
+      const gtsam::NavState predicted =
+          preint_->predict(gtsam::NavState(prev_pose, prev_vel), prev_bias);
+      const gtsam::Pose3 x_cur_init =
+          add_ndt ? prev_pose.compose(acc.delta) : predicted.pose();
+      const gtsam::Velocity3 v_cur_init = predicted.velocity();
+
+      // Backbone: ImuFactor (pose+velocity) + separate bias random-walk factor.
+      const gtsam::ImuFactor imu_factor(x_prev, sym::V(prev_idx), x_cur,
+                                        sym::V(kf_index_), sym::B(prev_idx), pim);
+      const gtsam::BetweenFactor<gtsam::imuBias::ConstantBias> bias_factor(
+          sym::B(prev_idx), sym::B(kf_index_), gtsam::imuBias::ConstantBias{},
+          biasRandomWalkNoise(pim.deltaTij()));
+
+      optimizer_.add_imu_keyframe(x_cur, x_cur_init, sym::V(kf_index_), v_cur_init,
+                                  sym::B(kf_index_), prev_bias, imu_factor, bias_factor);
+      if (add_ndt) {
+        optimizer_.add_ndt_edge(ndt_factor);
+      }
+      optimizer_.update();
+
+      // Diagnostics (L5-03e): per-edge chi2 = 2*factor.error on the fresh estimate.
+      const gtsam::Values est_after = optimizer_.estimate();
+      last_imu_chi2_ = 2.0 * imu_factor.error(est_after);
+      last_bias_chi2_ = 2.0 * bias_factor.error(est_after);
+      last_ndt_chi2_ = add_ndt ? 2.0 * ndt_factor.error(est_after) : -1.0;
+
+      // Reset preintegration to node j's optimized bias for the next interval.
+      last_opt_bias_ = est_after.at<gtsam::imuBias::ConstantBias>(sym::B(kf_index_));
+      preint_->reset(last_opt_bias_);
+    } else {
+      // Pre-L5-03 path (NDT-only / no-IMU fallback): NDT edge inserts X(j);
+      // V/B held by weak scaffolding priors.
+      const gtsam::Pose3 x_cur_init = prev_pose.compose(acc.delta);
+      optimizer_.add_odometry(ndt_factor, x_cur, x_cur_init);
+      addVelocityBiasScaffolding(kf_index_);
+      optimizer_.update();
+
+      const gtsam::Values est_after = optimizer_.estimate();
+      last_ndt_chi2_ = 2.0 * ndt_factor.error(est_after);
+      last_imu_chi2_ = -1.0;
+      last_bias_chi2_ = -1.0;
+      last_opt_bias_ = est_after.at<gtsam::imuBias::ConstantBias>(sym::B(kf_index_));
+    }
     accumulator_.reset();
     last_kf_stamp_ = current_stamp;
     storeKeyframeCloud(x_cur);
@@ -552,11 +863,54 @@ class GraphBackendNode : public rclcpp::Node {
     RCLCPP_INFO(get_logger(), "KF x%zu added (%.2f, %.2f, %.2f) | total nodes: %zu.",
                 kf_index_, current_pose.translation().x(), current_pose.translation().y(),
                 current_pose.translation().z(), kf_index_ + 1);
+    if (use_imu) {
+      const gtsam::Vector6 b = last_opt_bias_.vector();
+      RCLCPP_INFO(get_logger(),
+                  "  edge x%zu->x%zu | chi2 imu %.3f (dof 9) ndt %.3f (dof 6) "
+                  "bias %.3e (dof 6) | bias acc [%.4f %.4f %.4f] gyro [%.4f %.4f %.4f]",
+                  prev_idx, kf_index_, last_imu_chi2_, last_ndt_chi2_, last_bias_chi2_,
+                  b(0), b(1), b(2), b(3), b(4), b(5));
+    }
 
     // SLAM-10: verify any loop-closure candidates for the new keyframe and, on a
     // strong + well-conditioned NDT match, add a BetweenFactor that re-optimizes
     // the whole graph (map->odom jumps, Sigma_post shrinks for the looped poses).
     processLoopClosures(current_stamp);
+  }
+
+  // L5-03: LIO-SAM's bias random-walk noise for the BetweenFactor<imuBias> over an
+  // interval of dt seconds — sigmas = sqrt(dt) * [accBiasRW x3, gyrBiasRW x3]
+  // (ConstantBias tangent order is accelerometer-then-gyroscope). Mirrors LIO-SAM's
+  // noiseModelBetweenBias scaling exactly (keeps the ours-vs-LIO-SAM comparison a
+  // controlled one).
+  gtsam::SharedNoiseModel biasRandomWalkNoise(double dt) const {
+    const double s = std::sqrt(std::max(dt, 1e-9));
+    gtsam::Vector6 sigmas;
+    sigmas << preint_config_.accel_bias_rw_sigma * s,
+        preint_config_.accel_bias_rw_sigma * s,
+        preint_config_.accel_bias_rw_sigma * s,
+        preint_config_.gyro_bias_rw_sigma * s,
+        preint_config_.gyro_bias_rw_sigma * s,
+        preint_config_.gyro_bias_rw_sigma * s;
+    return gtsam::noiseModel::Diagonal::Sigmas(sigmas);
+  }
+
+  // L5-02 scaffolding: used only on the NDT-only / no-IMU path now (L5-03). A new
+  // node's V(i)/B(i) would be factorless and iSAM2 would reject them — hold each
+  // with a weak prior at zero. No factor couples the velocity/bias block to the
+  // pose block, so on that path the pose estimate, its marginals, and chi2 are
+  // unchanged vs pre-L5-02. When the IMU backbone is active the ImuFactor +
+  // BetweenFactor<imuBias> replace these priors.
+  void addVelocityBiasScaffolding(std::size_t index) {
+    const gtsam::Velocity3 zero_velocity = gtsam::Velocity3::Zero();
+    const gtsam::imuBias::ConstantBias zero_bias;
+    optimizer_.add_prior(
+        gtsam::PriorFactor<gtsam::Velocity3>(sym::V(index), zero_velocity,
+                                             scaffold_velocity_noise_),
+        sym::V(index), zero_velocity);
+    optimizer_.add_prior(gtsam::PriorFactor<gtsam::imuBias::ConstantBias>(
+                             sym::B(index), zero_bias, scaffold_bias_noise_),
+                         sym::B(index), zero_bias);
   }
 
   // Snapshot the buffered scan as this keyframe's cloud (SLAM-10). If no scan has
@@ -587,7 +941,7 @@ class GraphBackendNode : public rclcpp::Node {
     std::vector<Eigen::Matrix<double, 6, 6>> covs;
     covs.reserve(viz.nodeCount());
     for (std::size_t i = 0; i < viz.nodeCount(); ++i) {
-      covs.push_back(optimizer_.marginalCovariance(gtsam::Symbol('x', i)));
+      covs.push_back(optimizer_.marginalCovariance(sym::X(i)));
     }
     ellipsoids_pub_->publish(buildCovarianceEllipsoids(
         viz, covs, loop_affected_, map_frame_, stamp, covariance_marker_scale_));
@@ -636,11 +990,13 @@ class GraphBackendNode : public rclcpp::Node {
   // SLAM-11: publish optimizer health (chi2 + latest Sigma_post position-trace)
   // to /slam/diagnostics (JSON line) and append one row to the CSV log.
   void emitDiagnostics(const rclcpp::Time& stamp) {
-    const gtsam::Key latest_key = gtsam::Symbol('x', kf_index_);
+    const gtsam::Key latest_key = sym::X(kf_index_);
     const gtsam::Values est = optimizer_.estimate();
     const double chi2 = optimizer_.chi2();
     const double cov_trace = optimizer_.marginalCovPositionTrace(latest_key);
-    const std::size_t num_factors = est.size();  // == num nodes
+    // Keyframe count. (Was est.size() when nodes were pose-only; since L5-02
+    // the estimate holds X+V+B per keyframe, so est.size() is 3x this.)
+    const std::size_t num_factors = kf_index_ + 1;
     const auto keyframe_id = static_cast<int>(kf_index_);
 
     // SLAM-09: detect revisits of much-older keyframes (detection only; no factor
@@ -667,6 +1023,10 @@ class GraphBackendNode : public rclcpp::Node {
                   best.distance_m, candidates.size());
     }
 
+    // L5-03e: per-edge chi2 + optimized bias trajectory (accel-then-gyro).
+    const gtsam::Vector3 ba = last_opt_bias_.accelerometer();
+    const gtsam::Vector3 bg = last_opt_bias_.gyroscope();
+
     std::ostringstream json;
     json << std::setprecision(9) << "{\"t\": " << stamp.seconds()
          << ", \"keyframe_id\": " << keyframe_id
@@ -674,31 +1034,45 @@ class GraphBackendNode : public rclcpp::Node {
          << ", \"num_values\": " << num_factors
          << ", \"chi2\": " << chi2
          << ", \"marginal_cov_trace\": " << cov_trace
+         << ", \"imu_chi2\": " << last_imu_chi2_
+         << ", \"ndt_chi2\": " << last_ndt_chi2_
+         << ", \"bias_chi2\": " << last_bias_chi2_
+         << ", \"bias_acc\": [" << ba.x() << ", " << ba.y() << ", " << ba.z() << "]"
+         << ", \"bias_gyro\": [" << bg.x() << ", " << bg.y() << ", " << bg.z() << "]"
          << ", \"loop_candidates\": " << lc.str() << "}";
 
     std_msgs::msg::String diag_msg;
     diag_msg.data = json.str();
     diagnostics_pub_->publish(diag_msg);
 
-    // EVAL-05 §9 row: optimized pose + GT + full 6x6 Sigma_post upper triangle.
-    const gtsam::Pose3 est_pose = est.at<gtsam::Pose3>(latest_key);
-    const Eigen::Matrix<double, 6, 6> cov = optimizer_.marginalCovariance(latest_key);
-    writeCsvRow(stamp.seconds(), keyframe_id, "keyframe", est_pose, cov, "", "");
+    // EVAL-05 §9 row: optimized pose + velocity + bias (L5-05 schema v2) + GT +
+    // full 6x6 Sigma_post upper triangle. Read through the L5-02 NodeState struct.
+    const graph::NodeState node = optimizer_.nodeEstimate(kf_index_);
+    writeCsvRow(stamp.seconds(), keyframe_id, "keyframe", node, "", "");
   }
 
   // EVAL-05 / ARCHITECTURE §9 logging contract: one CSV row per diagnostic event.
   // `event` is "keyframe" or "loop_closure"; lc_from/lc_to are filled only for
-  // closures. Columns (exact §9 order): t, keyframe_id, event, est_x..est_qw,
-  // gt_x..gt_qw, then the upper triangle of the 6x6 Sigma_post (GTSAM tangent
-  // order rx,ry,rz,x,y,z), then lc_from, lc_to.
+  // closures. Columns (schema v2, L5-05): schema_version, t, keyframe_id, event,
+  // est_x..est_qw, then the L5-02 node state est_vx,est_vy,est_vz (Velocity3) and
+  // bias_ax,bias_ay,bias_az,bias_gx,bias_gy,bias_gz (imuBias, accel-then-gyro),
+  // then gt_x..gt_qw, then the upper triangle of the 6x6 Sigma_post (pose marginal,
+  // GTSAM tangent order rx,ry,rz,x,y,z), then lc_from, lc_to. The leading
+  // schema_version column tags the file so downstream parsers reject a pre-L5 (v1)
+  // CSV loudly instead of silently reading the wrong columns. Velocity/bias marginal
+  // variances are intentionally NOT logged (NodeState carries only the pose
+  // marginal; adding them is deferred — see the L5-05 design note).
+  static constexpr int kEval05SchemaVersion = 2;
   void writeCsvRow(double t, int keyframe_id, const std::string& event,
-                   const gtsam::Pose3& est, const Eigen::Matrix<double, 6, 6>& cov,
-                   const std::string& lc_from, const std::string& lc_to) {
+                   const graph::NodeState& node, const std::string& lc_from,
+                   const std::string& lc_to) {
     if (!csv_open_) {
       csv_.open(diagnostics_csv_path_, std::ios::out | std::ios::trunc);
       if (csv_.is_open()) {
-        csv_ << "t,keyframe_id,event,"
+        csv_ << "schema_version,t,keyframe_id,event,"
                 "est_x,est_y,est_z,est_qx,est_qy,est_qz,est_qw,"
+                "est_vx,est_vy,est_vz,"
+                "bias_ax,bias_ay,bias_az,bias_gx,bias_gy,bias_gz,"
                 "gt_x,gt_y,gt_z,gt_qx,gt_qy,gt_qz,gt_qw,"
                 "cov_00,cov_01,cov_02,cov_03,cov_04,cov_05,"
                 "cov_11,cov_12,cov_13,cov_14,cov_15,"
@@ -716,16 +1090,23 @@ class GraphBackendNode : public rclcpp::Node {
       return;
     }
 
-    const gtsam::Point3 et = est.translation();
-    const gtsam::Quaternion eq = est.rotation().toQuaternion();
+    const gtsam::Point3 et = node.pose.translation();
+    const gtsam::Quaternion eq = node.pose.rotation().toQuaternion();
+    const gtsam::Velocity3& v = node.velocity;
+    const gtsam::Vector3 ba = node.bias.accelerometer();
+    const gtsam::Vector3 bg = node.bias.gyroscope();
+    const Eigen::Matrix<double, 6, 6>& cov = node.covariance;
     const geometry_msgs::msg::Pose& gt = latest_gt_.pose;
 
-    csv_ << std::setprecision(9) << t << ',' << keyframe_id << ',' << event << ','
-         << et.x() << ',' << et.y() << ',' << et.z() << ',' << eq.x() << ',' << eq.y()
-         << ',' << eq.z() << ',' << eq.w() << ',' << gt.position.x << ','
-         << gt.position.y << ',' << gt.position.z << ',' << gt.orientation.x << ','
-         << gt.orientation.y << ',' << gt.orientation.z << ',' << gt.orientation.w;
-    // Upper triangle of the symmetric 6x6: row r, columns r..5.
+    csv_ << std::setprecision(9) << kEval05SchemaVersion << ',' << t << ','
+         << keyframe_id << ',' << event << ',' << et.x() << ',' << et.y() << ','
+         << et.z() << ',' << eq.x() << ',' << eq.y() << ',' << eq.z() << ',' << eq.w()
+         << ',' << v.x() << ',' << v.y() << ',' << v.z() << ',' << ba.x() << ','
+         << ba.y() << ',' << ba.z() << ',' << bg.x() << ',' << bg.y() << ',' << bg.z()
+         << ',' << gt.position.x << ',' << gt.position.y << ',' << gt.position.z << ','
+         << gt.orientation.x << ',' << gt.orientation.y << ',' << gt.orientation.z
+         << ',' << gt.orientation.w;
+    // Upper triangle of the symmetric 6x6 pose marginal: row r, columns r..5.
     for (int r = 0; r < 6; ++r) {
       for (int c = r; c < 6; ++c) {
         csv_ << ',' << cov(r, c);
@@ -742,7 +1123,7 @@ class GraphBackendNode : public rclcpp::Node {
   // every verdict to /slam/diagnostics; reject leaves the graph untouched.
   void processLoopClosures(const rclcpp::Time& stamp) {
     const gtsam::Values est = optimizer_.estimate();
-    const gtsam::Key latest_key = gtsam::Symbol('x', kf_index_);
+    const gtsam::Key latest_key = sym::X(kf_index_);
     const auto candidates = finder_.findCandidates(est, latest_key);
 
     for (const LoopClosureCandidate& c : candidates) {
@@ -796,7 +1177,7 @@ class GraphBackendNode : public rclcpp::Node {
   // preceding keyframe row — ARCHITECTURE §9).
   void logLoopClosure(const rclcpp::Time& stamp, int query, int match, double score,
                       bool accepted, const std::string& reason) {
-    const gtsam::Key latest_key = gtsam::Symbol('x', kf_index_);
+    const gtsam::Key latest_key = sym::X(kf_index_);
     const double chi2 = optimizer_.chi2();
     const double cov_trace = optimizer_.marginalCovPositionTrace(latest_key);
 
@@ -817,10 +1198,9 @@ class GraphBackendNode : public rclcpp::Node {
     diagnostics_pub_->publish(diag_msg);
 
     if (accepted) {
-      const gtsam::Pose3 est_pose = optimizer_.estimate().at<gtsam::Pose3>(latest_key);
-      const Eigen::Matrix<double, 6, 6> cov = optimizer_.marginalCovariance(latest_key);
-      writeCsvRow(stamp.seconds(), static_cast<int>(kf_index_), "loop_closure", est_pose,
-                  cov, std::to_string(match), std::to_string(query));
+      const graph::NodeState node = optimizer_.nodeEstimate(kf_index_);
+      writeCsvRow(stamp.seconds(), static_cast<int>(kf_index_), "loop_closure", node,
+                  std::to_string(match), std::to_string(query));
     }
   }
 
@@ -833,6 +1213,18 @@ class GraphBackendNode : public rclcpp::Node {
 
   // State
   bool bootstrapped_ = false;
+  // L5-02: weak scaffolding priors holding V(i)/B(i) on the NDT-only path.
+  gtsam::SharedNoiseModel scaffold_velocity_noise_;
+  gtsam::SharedNoiseModel scaffold_bias_noise_;
+  // L5-04: principled bootstrap priors for X(0)/V(0)/B(0) (sigmas kept for the
+  // clean-init log line).
+  gtsam::SharedNoiseModel bootstrap_pose_noise_;
+  gtsam::SharedNoiseModel bootstrap_velocity_noise_;
+  gtsam::SharedNoiseModel bootstrap_bias_noise_;
+  double bootstrap_pose_sigma_ = 0.001;
+  double bootstrap_velocity_sigma_ = 0.1;
+  double bootstrap_accel_bias_sigma_ = 0.1;
+  double bootstrap_gyro_bias_sigma_ = 0.01;
   gtsam::Pose3 last_pose_;
   rclcpp::Time last_kf_stamp_{0, 0, RCL_ROS_TIME};
   std::size_t kf_index_ = 0;
@@ -850,12 +1242,37 @@ class GraphBackendNode : public rclcpp::Node {
   std::set<std::size_t> loop_affected_;
   std::vector<std::pair<int, int>> loop_edges_;  // {match, query} per accepted closure
 
+  // L5-01: IMU intake state (GtSample defined at the top of the private section).
+  imu::PreintegrationConfig preint_config_;
+  std::deque<imu::ImuSample> imu_buffer_;
+  std::deque<GtSample> gt_history_;
+  double diag_window_start_t_ = -1.0;
+
+  // L5-03: persistent preintegrator for the IMU backbone (built from
+  // preint_config_ in the ctor). last_imu_stamp_ gives consecutive-sample dt and
+  // stays continuous across keyframes (only the PIM accumulation is reset()).
+  std::optional<imu::ImuPreintegrator> preint_;
+  double last_imu_stamp_ = -1.0;
+  // Latest per-edge chi2 (2*factor.error) + optimized bias, for /slam/diagnostics
+  // + the per-keyframe log. -1 = not applicable this keyframe (e.g. an NDT-only
+  // edge has no IMU/bias chi2).
+  double last_imu_chi2_ = -1.0;
+  double last_ndt_chi2_ = -1.0;
+  double last_bias_chi2_ = -1.0;
+  gtsam::imuBias::ConstantBias last_opt_bias_;
+
   // Params
   std::string map_frame_;
   std::string odom_frame_;
   std::string ndt_odom_topic_;
   std::string scan_topic_;
   std::string gt_topic_;
+  std::string imu_topic_;
+  double imu_buffer_seconds_ = 5.0;
+  bool imu_diagnostic_enabled_ = false;
+  double imu_diagnostic_window_s_ = 1.0;
+  bool imu_factor_enabled_ = true;
+  bool ndt_factor_enabled_ = true;
   double sphere_diameter_m_ = 0.15;
   double edge_line_width_m_ = 0.03;
   double covariance_marker_scale_ = 1.0;
@@ -870,6 +1287,7 @@ class GraphBackendNode : public rclcpp::Node {
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr scan_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr gt_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr keyframes_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr edges_pub_;

@@ -34,14 +34,47 @@ from matplotlib.patches import Ellipse
 
 CHI2_2DOF_95 = 5.991  # 95% confidence, 2 DOF
 
+# Columns every schema version must carry for these plots (position + Sigma_post).
+_REQUIRED_BASE = ["t", "keyframe_id", "event",
+                  "est_x", "est_y", "est_z",
+                  "gt_x", "gt_y", "gt_z",
+                  "cov_33", "cov_34", "cov_35", "cov_44", "cov_45", "cov_55"]
+# Columns the L5-05 velocity/bias schema (v2) adds.
+_V2_COLUMNS = ["est_vx", "est_vy", "est_vz",
+               "bias_ax", "bias_ay", "bias_az",
+               "bias_gx", "bias_gy", "bias_gz"]
+
+
+def check_schema(fieldnames, path):
+    """Validate the CSV columns and return the schema version (int).
+
+    L5-05 (v2) tags the covariance log with a `schema_version` column and adds the
+    velocity/bias state columns; pre-L5 CSVs lack the tag and are read as v1. A file
+    missing a base column, or a v2-tagged file missing its velocity/bias columns,
+    raises SystemExit with a named message — never a silent wrong-column parse.
+    """
+    fields = set(fieldnames or [])
+    missing = [c for c in _REQUIRED_BASE if c not in fields]
+    if missing:
+        raise SystemExit(f"eval05_plot: {path} is not a valid EVAL-05 covariance "
+                         f"log — missing columns {missing}.")
+    if "schema_version" in fields:
+        missing_v2 = [c for c in _V2_COLUMNS if c not in fields]
+        if missing_v2:
+            raise SystemExit(f"eval05_plot: {path} is tagged schema_version but "
+                             f"missing v2 velocity/bias columns {missing_v2} — "
+                             "corrupt or truncated CSV.")
+        return 2
+    return 1
+
 
 def load_rows(path):
-    """Parse the CSV into a list of dict rows (all numeric fields as float)."""
-    rows = []
+    """Parse the CSV into (rows, schema_version) after validating the schema."""
     with open(path, newline="") as f:
-        for row in csv.DictReader(f):
-            rows.append(row)
-    return rows
+        reader = csv.DictReader(f)
+        version = check_schema(reader.fieldnames, path)
+        rows = list(reader)
+    return rows, version
 
 
 def position_cov_3x3(row):
@@ -207,7 +240,8 @@ def main():
     if not os.path.isfile(args.csv):
         print(f"eval05_plot: CSV not found: {args.csv}", file=sys.stderr)
         return 1
-    rows = load_rows(args.csv)
+    rows, version = load_rows(args.csv)
+    print(f"eval05_plot: {args.csv} parsed as schema v{version}")
     if not rows:
         print(f"eval05_plot: CSV has no data rows: {args.csv}", file=sys.stderr)
         return 1

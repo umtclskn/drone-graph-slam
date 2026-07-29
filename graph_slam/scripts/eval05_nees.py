@@ -30,10 +30,44 @@ import numpy as np
 # time (this script is position-only, dim = 3).
 CHI2_3DOF_95 = 7.815
 
+# Columns NEES needs (position error + Sigma_post position block); shared by every
+# schema version.
+_REQUIRED_BASE = ["event", "keyframe_id",
+                  "est_x", "est_y", "est_z",
+                  "gt_x", "gt_y", "gt_z",
+                  "cov_33", "cov_34", "cov_35", "cov_44", "cov_45", "cov_55"]
+# Columns the L5-05 velocity/bias schema (v2) adds.
+_V2_COLUMNS = ["est_vx", "est_vy", "est_vz",
+               "bias_ax", "bias_ay", "bias_az",
+               "bias_gx", "bias_gy", "bias_gz"]
+
+
+def check_schema(fieldnames, path):
+    """Validate the CSV columns and return the schema version (int).
+
+    L5-05 (v2) tags the covariance log with a `schema_version` column and adds the
+    velocity/bias state columns; pre-L5 CSVs lack the tag and are read as v1. A file
+    missing a base column, or a v2-tagged file missing its velocity/bias columns,
+    raises SystemExit with a named message — never a silent wrong-column parse.
+    """
+    fields = set(fieldnames or [])
+    missing = [c for c in _REQUIRED_BASE if c not in fields]
+    if missing:
+        raise SystemExit(f"eval05_nees: {path} is not a valid EVAL-05 covariance "
+                         f"log — missing columns {missing}.")
+    if "schema_version" in fields:
+        missing_v2 = [c for c in _V2_COLUMNS if c not in fields]
+        if missing_v2:
+            raise SystemExit(f"eval05_nees: {path} is tagged schema_version but "
+                             f"missing v2 velocity/bias columns {missing_v2} — "
+                             "corrupt or truncated CSV.")
+        return 2
+    return 1
+
 
 def load_keyframes(path):
     """Return (errors Nx3, position covariances Nx3x3, keyframe_ids,
-    loop_closure_keyframe_ids, skipped_count).
+    loop_closure_keyframe_ids, skipped_count, schema_version).
 
     Only event == "keyframe" rows feed the NEES stats (loop_closure rows are the
     same keyframe logged again after correction — counting both double-counts).
@@ -47,7 +81,9 @@ def load_keyframes(path):
     skipped = 0
 
     with open(path, newline="") as f:
-        for row in csv.DictReader(f):
+        reader = csv.DictReader(f)
+        version = check_schema(reader.fieldnames, path)
+        for row in reader:
             if row["event"] == "loop_closure":
                 lc_ids.append(float(row["keyframe_id"]))
                 continue
@@ -78,7 +114,7 @@ def load_keyframes(path):
             kf_ids.append(float(row["keyframe_id"]))
 
     return (np.array(errors), np.array(covs), np.array(kf_ids),
-            np.array(lc_ids), skipped)
+            np.array(lc_ids), skipped, version)
 
 
 def compute_nees(errors, covs):
@@ -189,7 +225,8 @@ def main():
         print(f"eval05_nees: CSV not found: {args.csv}", file=sys.stderr)
         return 1
 
-    errors, covs, kf_ids, lc_ids, skipped = load_keyframes(args.csv)
+    errors, covs, kf_ids, lc_ids, skipped, version = load_keyframes(args.csv)
+    print(f"eval05_nees: {args.csv} parsed as schema v{version}")
     if len(errors) == 0:
         print("eval05_nees: no positive-definite keyframe rows found", file=sys.stderr)
         return 1

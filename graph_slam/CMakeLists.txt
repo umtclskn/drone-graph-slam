@@ -43,6 +43,7 @@ add_library(${PROJECT_NAME}
   src/ndt_voxel_grid.cpp
   src/ndt_registrar.cpp
   src/pcl_ndt_baseline.cpp
+  src/imu/imu_preintegrator.cpp
   src/registration_gate.cpp
   src/relative_error.cpp
   src/trajectory_metrics.cpp
@@ -128,6 +129,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_ndt_voxel_grid ${PROJECT_NAME})
   ament_add_gtest(test_ndt_registrar test/test_ndt_registrar.cpp)
   target_link_libraries(test_ndt_registrar ${PROJECT_NAME})
+  # L5-01d: ROS-free ImuPreintegrator closed-form + covariance tests.
+  ament_add_gtest(test_imu_preintegrator test/test_imu_preintegrator.cpp)
+  target_link_libraries(test_imu_preintegrator ${PROJECT_NAME})
   ament_add_gtest(test_registration_gate test/test_registration_gate.cpp)
   target_link_libraries(test_registration_gate ${PROJECT_NAME})
   ament_add_gtest(test_ndt_covariance test/test_ndt_covariance.cpp)
