@@ -5,14 +5,13 @@
 namespace graph_slam {
 
 /// Relative-motion seed for scan-to-scan NDT (NDT-08). Given two absolute poses
-/// in a common frame — e.g. two consecutive EKF2 odometry poses, already in the
-/// ENU/base_link frame the px4_offboard adapter produces — returns the relative
-/// transform T_a_b = world_from_a^{-1} * world_from_b. This is the initial guess
-/// fed to NdtRegistrar::align; NDT is initial-guess sensitive, so a good prior is
-/// the biggest cheap accuracy win.
+/// in a common frame — since L5-06 the IMU-predicted pose at the keyframe and at
+/// the current scan — returns the relative transform
+/// T_a_b = world_from_a^{-1} * world_from_b. This is the initial guess fed to
+/// NdtRegistrar::align; NDT is initial-guess sensitive, so a good prior is the
+/// biggest cheap accuracy win.
 ///
-/// ROS-free and px4-free by design: the px4_msgs -> Eigen / NED->ENU conversion is
-/// the adapter's job (ARCHITECTURE §3, §5), never this package's.
+/// ROS-free by design: the pose source is the caller's concern.
 inline Eigen::Matrix4f relativePoseGuess(const Eigen::Matrix4f& world_from_a,
                                          const Eigen::Matrix4f& world_from_b) {
   // Rigid inverse of an SE(3) matrix: R^T and -R^T t. Cheaper and numerically

@@ -32,6 +32,10 @@ find_package(visualization_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(pcl_conversions REQUIRED)
 find_package(ament_index_cpp REQUIRED)
+# L5-06: the typed optimized-state feed (back-end publisher, front-end predictor
+# reset). Its own package because rosidl_generate_interfaces wants a target named
+# after the package, which would clash with the graph_slam library target.
+find_package(graph_slam_msgs REQUIRED)
 
 # --- Core library -----------------------------------------------------------
 # graph_slam carries compiled algorithm classes (NDT-03 Preprocessor, NDT-05/06
@@ -87,7 +91,7 @@ add_executable(ndt_frontend_node src/ndt_frontend_node.cpp src/ndt_frontend_main
 target_include_directories(ndt_frontend_node PRIVATE src)
 target_link_libraries(ndt_frontend_node ${PROJECT_NAME})
 ament_target_dependencies(ndt_frontend_node
-  rclcpp sensor_msgs nav_msgs geometry_msgs pcl_conversions tf2_ros)
+  rclcpp sensor_msgs nav_msgs geometry_msgs pcl_conversions tf2_ros graph_slam_msgs)
 
 # --- GRAPH-VIS-01 graph visualization node (ROS executable) -----------------
 add_executable(graph_visualizer_node src/graph_visualizer_node.cpp)
@@ -103,7 +107,7 @@ target_include_directories(graph_backend_node PRIVATE src)
 target_link_libraries(graph_backend_node ${PROJECT_NAME})
 ament_target_dependencies(graph_backend_node
   rclcpp nav_msgs geometry_msgs visualization_msgs tf2_ros std_msgs
-  sensor_msgs pcl_conversions)
+  sensor_msgs pcl_conversions graph_slam_msgs)
 
 # --- Install ----------------------------------------------------------------
 install(DIRECTORY include/ DESTINATION include)
@@ -121,6 +125,8 @@ ament_export_dependencies(PCL Eigen3 GTSAM)
 # --- Tests ------------------------------------------------------------------
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  # L5-06: the front-end node test drives the node's sim clock via /clock.
+  find_package(rosgraph_msgs REQUIRED)
   ament_add_gtest(test_preprocessor test/test_preprocessor.cpp)
   target_link_libraries(test_preprocessor ${PROJECT_NAME})
   ament_add_gtest(test_quality_checker test/test_quality_checker.cpp)
@@ -167,7 +173,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_graph_backend_node ${PROJECT_NAME})
   ament_target_dependencies(test_graph_backend_node
     rclcpp nav_msgs geometry_msgs visualization_msgs tf2_ros std_msgs
-    sensor_msgs pcl_conversions)
+    sensor_msgs pcl_conversions graph_slam_msgs)
   # SLAM-10: loop-closure verifier (ROS-free; links the compiled library).
   ament_add_gtest(test_loop_closure_verifier test/test_loop_closure_verifier.cpp)
   target_link_libraries(test_loop_closure_verifier ${PROJECT_NAME})
@@ -178,14 +184,15 @@ if(BUILD_TESTING)
   target_include_directories(test_ndt_frontend_node PRIVATE src)
   target_link_libraries(test_ndt_frontend_node ${PROJECT_NAME})
   ament_target_dependencies(test_ndt_frontend_node
-    rclcpp sensor_msgs nav_msgs geometry_msgs pcl_conversions tf2_ros)
+    rclcpp sensor_msgs nav_msgs geometry_msgs pcl_conversions tf2_ros graph_slam_msgs
+    rosgraph_msgs)
 
   # INFRA-01: TF chain smoke test (map->odom->base_link lookup after first scan).
   ament_add_gtest(test_tf_tree test/test_tf_tree.cpp src/ndt_frontend_node.cpp)
   target_include_directories(test_tf_tree PRIVATE src)
   target_link_libraries(test_tf_tree ${PROJECT_NAME})
   ament_target_dependencies(test_tf_tree
-    rclcpp sensor_msgs nav_msgs geometry_msgs pcl_conversions tf2_ros)
+    rclcpp sensor_msgs nav_msgs geometry_msgs pcl_conversions tf2_ros graph_slam_msgs)
 
   # NDT-14 replay-harness logic: ROS-free pytest of the baseline YAML parse and
   # the pass/fail evaluation (the harness lazy-imports rclpy, so this stays

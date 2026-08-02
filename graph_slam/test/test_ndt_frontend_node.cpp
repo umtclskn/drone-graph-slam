@@ -11,9 +11,12 @@
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <chrono>
+#include <graph_slam_msgs/msg/optimized_state.hpp>
 #include <memory>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
+#include <rosgraph_msgs/msg/clock.hpp>
+#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <vector>
 
@@ -50,14 +53,26 @@ sensor_msgs::msg::PointCloud2 makeSpreadCloud(const rclcpp::Time& stamp) {
   return msg;
 }
 
-nav_msgs::msg::Odometry makeEkf2Odom(const rclcpp::Time& stamp, double x) {
-  nav_msgs::msg::Odometry odom;
-  odom.header.stamp = stamp;
-  odom.header.frame_id = "odom";
-  odom.child_frame_id = "base_link";
-  odom.pose.pose.position.x = x;
-  odom.pose.pose.orientation.w = 1.0;
-  return odom;
+/// L5-06 anchor for the front-end IMU predictor: an optimized state at the
+/// origin moving at `vx` along +x, zero bias.
+graph_slam_msgs::msg::OptimizedState makeOptimizedState(const rclcpp::Time& stamp,
+                                                        double vx) {
+  graph_slam_msgs::msg::OptimizedState state;
+  state.header.stamp = stamp;
+  state.header.frame_id = "map";
+  state.pose.orientation.w = 1.0;
+  state.velocity.x = vx;
+  return state;
+}
+
+/// A stationary/constant-velocity IMU sample in ENU: the accelerometer measures
+/// specific force, so a body with zero world acceleration reads +g on z.
+sensor_msgs::msg::Imu makeLevelImu(const rclcpp::Time& stamp, double gravity) {
+  sensor_msgs::msg::Imu imu;
+  imu.header.stamp = stamp;  // ignored by the node, which re-stamps with its clock
+  imu.header.frame_id = "base_link";
+  imu.linear_acceleration.z = gravity;
+  return imu;
 }
 
 /// Node options that make EVERY registration fail the NDT-11 gate (impossible
@@ -99,15 +114,20 @@ TEST(NdtFrontendNodeTest, ConstructsAndSpinsWithoutCrashing) {
 TEST(NdtFrontendNodeTest, DeclaresDocumentedParameters) {
   const auto node = graph_slam::createNdtFrontendNode();
   EXPECT_EQ(node->get_parameter("lidar_topic").as_string(), "/x500/lidar_3d/points");
-  EXPECT_EQ(node->get_parameter("ekf2_topic").as_string(), "/odometry/ekf2");
+  // L5-06: the guess inputs replaced ekf2_topic, which no longer exists.
+  EXPECT_EQ(node->get_parameter("imu_topic").as_string(), "/imu/data");
+  EXPECT_EQ(node->get_parameter("optimized_state_topic").as_string(),
+            "/slam/optimized_state");
+  EXPECT_FALSE(node->has_parameter("ekf2_topic"));
   EXPECT_DOUBLE_EQ(node->get_parameter("min_translation_m").as_double(), 0.3);
   EXPECT_DOUBLE_EQ(node->get_parameter("min_rotation_deg").as_double(), 5.0);
   EXPECT_TRUE(node->get_parameter("publish_debug_clouds").as_bool());
 }
 
 // NDT-11 gate enforcement, no-prior branch: when every registration is
-// rejected and no EKF2 odometry ever arrived, only the bootstrap odom message
-// may appear — the rejected step must NOT be published or advance the keyframe.
+// rejected and no optimized state ever arrived (so the L5-06 predictor has no
+// anchor), only the bootstrap odom message may appear — the rejected step must
+// NOT be published or advance the keyframe.
 TEST(NdtFrontendNodeTest, GateRejectWithoutPriorSkipsScan) {
   const auto node = graph_slam::createNdtFrontendNode(rejectingGateOptions());
   auto helper = rclcpp::Node::make_shared("gate_test_helper_noprior");
@@ -136,16 +156,43 @@ TEST(NdtFrontendNodeTest, GateRejectWithoutPriorSkipsScan) {
   EXPECT_EQ(received.size(), 1U) << "rejected registration without a prior must not publish";
 }
 
-// NDT-11 gate enforcement, fallback branch: with an EKF2 prior available, a
-// rejected registration publishes the EKF2 relative motion instead, carrying
-// the geometry-agnostic fallback covariance (sigma_t=0.1 m, sigma_rot=0.01 rad).
-TEST(NdtFrontendNodeTest, GateRejectFallsBackToEkf2Delta) {
-  const auto node = graph_slam::createNdtFrontendNode(rejectingGateOptions());
-  auto helper = rclcpp::Node::make_shared("gate_test_helper_fallback");
+// L5-06c: a rejected registration is skipped even when the IMU predictor has a
+// perfectly good prediction available. This replaces the old
+// GateRejectFallsBackToEkf2Delta test: substituting the prior for the rejected
+// NDT output was safe while the prior was EKF2 (an independent source) but
+// became a feedback loop once the prior is the IMU prediction that the
+// back-end's own optimized state re-anchors (see the comment at the gate).
+//
+// The setup also exercises the whole L5-06 plumbing end to end — /imu/data
+// intake, the optimized-state anchor, and predict() — on a synthetic
+// constant-velocity segment: anchored at the origin at 1 m/s along +x and fed
+// 0.5 s of level IMU (zero world acceleration), so the prediction is a pure
+// 0.5 m translation in x. The analytic accuracy of that prediction is covered
+// closed-form by the L5-01d ImuPreintegrator tests; what is node-level here is
+// that the node feeds it and no longer publishes it as a measurement.
+//
+// The node runs on sim time driven by this test, so the IMU dt it re-stamps
+// with (bag-replay-clock-domain) is exact and the result is deterministic
+// rather than wall-clock dependent.
+TEST(NdtFrontendNodeTest, GateRejectSkipsScanEvenWithPrediction) {
+  constexpr double kGravity = 9.8;
+  constexpr double kVelocity = 1.0;  // m/s along +x
+  constexpr double kStep = 0.05;     // s between IMU samples
+  constexpr int kSamples = 10;       // -> 0.5 s of integration, i.e. 0.5 m in x
+
+  rclcpp::NodeOptions options = rejectingGateOptions();
+  options.append_parameter_override("use_sim_time", true);
+  options.append_parameter_override("imu_gravity", kGravity);
+  const auto node = graph_slam::createNdtFrontendNode(options);
+
+  auto helper = rclcpp::Node::make_shared("gate_test_helper_prediction");
+  auto clock_pub = helper->create_publisher<rosgraph_msgs::msg::Clock>("/clock", 10);
   auto scan_pub = helper->create_publisher<sensor_msgs::msg::PointCloud2>(
       node->get_parameter("lidar_topic").as_string(), 10);
-  auto ekf2_pub = helper->create_publisher<nav_msgs::msg::Odometry>(
-      node->get_parameter("ekf2_topic").as_string(), 10);
+  auto imu_pub = helper->create_publisher<sensor_msgs::msg::Imu>(
+      node->get_parameter("imu_topic").as_string(), rclcpp::SensorDataQoS());
+  auto state_pub = helper->create_publisher<graph_slam_msgs::msg::OptimizedState>(
+      node->get_parameter("optimized_state_topic").as_string(), 10);
   std::vector<nav_msgs::msg::Odometry> received;
   auto odom_sub = helper->create_subscription<nav_msgs::msg::Odometry>(
       "/ndt_frontend/ndt_odom", 10,
@@ -159,26 +206,37 @@ TEST(NdtFrontendNodeTest, GateRejectFallsBackToEkf2Delta) {
       exec.spin_some(std::chrono::milliseconds(10));
     }
   };
+  double sim_t = 1000.0;
+  auto tick = [&](double dt) {
+    sim_t += dt;
+    rosgraph_msgs::msg::Clock clock;
+    clock.clock = rclcpp::Time(static_cast<int64_t>(sim_t * 1e9), RCL_ROS_TIME);
+    clock_pub->publish(clock);
+    pump();
+  };
 
-  ekf2_pub->publish(makeEkf2Odom(node->now(), 0.0));  // prior pose A
+  tick(0.0);
+  ASSERT_NEAR(node->now().seconds(), sim_t, 1e-6) << "node is not on the test's sim clock";
+
+  state_pub->publish(makeOptimizedState(node->now(), kVelocity));  // anchor the predictor
   pump();
-  scan_pub->publish(makeSpreadCloud(node->now()));  // bootstrap; snapshots prior A
+  imu_pub->publish(makeLevelImu(node->now(), kGravity));  // primes last_imu_stamp_
+  pump();
+
+  scan_pub->publish(makeSpreadCloud(node->now()));  // bootstrap; latches prediction
   pump();
   ASSERT_EQ(received.size(), 1U);
 
-  ekf2_pub->publish(makeEkf2Odom(node->now(), 0.5));  // prior pose B: +0.5 m in x
-  pump();
-  scan_pub->publish(makeSpreadCloud(node->now()));  // rejected -> EKF2 delta fallback
-  pump();
-  ASSERT_EQ(received.size(), 2U) << "fallback step must be published";
+  for (int i = 0; i < kSamples; ++i) {
+    tick(kStep);
+    imu_pub->publish(makeLevelImu(node->now(), kGravity));
+    pump();
+  }
 
-  const auto& odom = received.back();
-  EXPECT_NEAR(odom.pose.pose.position.x, 0.5, 1e-3);  // EKF2 delta, not NDT output
-  EXPECT_NEAR(odom.pose.pose.position.y, 0.0, 1e-3);
-  // nav covariance order [x,y,z,rx,ry,rz]: fallback diag(0.1^2 x3, 0.01^2 x3).
-  // Sigma is stored in float (Matrix6f), so compare at float precision.
-  EXPECT_NEAR(odom.pose.covariance[0], 0.01, 1e-8);   // x variance
-  EXPECT_NEAR(odom.pose.covariance[21], 1e-4, 1e-9);  // rx variance
+  scan_pub->publish(makeSpreadCloud(node->now()));  // rejected -> must be skipped
+  pump();
+  EXPECT_EQ(received.size(), 1U)
+      << "a rejected registration must not publish the IMU prediction as odometry";
 }
 
 }  // namespace

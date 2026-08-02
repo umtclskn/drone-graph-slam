@@ -52,7 +52,12 @@
     # block) to match the /** wildcard convention above: each maps to one
     # declare_parameter in the node, so a YAML edit retunes without a rebuild.
     lidar_topic: "/x500/lidar_3d/points"  # input cloud (remappable)
-    ekf2_topic: "/odometry/ekf2"          # NDT-08 prior (nav_msgs/Odometry, ENU)
+    # L5-06: the NDT initial guess is IMU-predicted, not EKF2. The front-end runs
+    # its own ImuPreintegrator over imu_topic (same key/topic the back-end reads)
+    # and re-seeds it from optimized_state_topic, the back-end's typed
+    # (pose, velocity, imuBias) feed. `ekf2_topic` is gone: EKF2 is no longer a
+    # guess, a fallback, or a prior anywhere in the stack.
+    optimized_state_topic: "/slam/optimized_state"  # graph_slam_msgs/OptimizedState
     odom_frame: "odom"                    # ~/ndt_odom header.frame_id
     base_frame: "base_link"               # ~/ndt_odom child_frame_id
     min_translation_m: 0.3                # keyframe trigger: translation since last KF

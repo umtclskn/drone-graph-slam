@@ -13,6 +13,10 @@ Usage:
 Outputs: ~/ndt_odom (nav_msgs/Odometry, T_odom_base + Sigma_meas), odom->base_link TF,
 plus optional ~/scan_raw and ~/scan_target debug clouds.
 
+L5-06: the NDT initial guess is IMU-predicted, so the front-end needs /imu/data
+(px4_offboard imu_bridge) and /slam/optimized_state (graph_backend_node) to be
+live; without them the guess degrades to identity.
+
 Static TF (launch file):
   map -> odom          identity stub until Sprint 3 GTSAM back-end owns map->odom
   base_link -> lidar_link   mount offset from slam_params.yaml tf.*
@@ -59,7 +63,7 @@ def _launch_setup(context, *args, **kwargs):
                 {
                     "use_sim_time": use_sim_time,
                     "lidar_topic": LaunchConfiguration("lidar_topic"),
-                    "ekf2_topic": LaunchConfiguration("ekf2_topic"),
+                    "imu_topic": LaunchConfiguration("imu_topic"),
                     "publish_debug_clouds": LaunchConfiguration("publish_debug_clouds"),
                 },
             ],
@@ -110,7 +114,7 @@ def generate_launch_description():
             DeclareLaunchArgument("params_file", default_value=default_params),
             DeclareLaunchArgument("use_sim_time", default_value="true"),
             DeclareLaunchArgument("lidar_topic", default_value="/x500/lidar_3d/points"),
-            DeclareLaunchArgument("ekf2_topic", default_value="/odometry/ekf2"),
+            DeclareLaunchArgument("imu_topic", default_value="/imu/data"),
             DeclareLaunchArgument("publish_debug_clouds", default_value="true"),
             DeclareLaunchArgument("rviz", default_value="false"),
             DeclareLaunchArgument("rviz_config", default_value=rviz_config),

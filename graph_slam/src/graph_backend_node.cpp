@@ -13,6 +13,9 @@
 //   /slam/keyframes            visualization_msgs/MarkerArray  (SPHERE per keyframe)
 //   /slam/graph_edges          visualization_msgs/Marker       (LINE_LIST odom chain)
 //   /slam/optimized_odom       nav_msgs/Odometry  (latest optimized pose)
+//   /slam/optimized_state      graph_slam_msgs/OptimizedState  (L5-06: the same
+//                              state PLUS velocity + IMU bias, which Odometry
+//                              cannot carry; seeds the front-end IMU predictor)
 //
 // TF published (dynamic, updated on each keyframe):
 //   map  →  odom   (ARCHITECTURE §5 REP-105 graph correction)
@@ -49,6 +52,8 @@
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
+#include <geometry_msgs/msg/vector3.hpp>
+#include <graph_slam_msgs/msg/optimized_state.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -123,6 +128,14 @@ Eigen::Isometry3d gtsamPoseToIsometry(const gtsam::Pose3& pose) {
 
 gtsam::Pose3 isometryToGtsamPose(const Eigen::Isometry3d& iso) {
   return {gtsam::Rot3(iso.linear()), gtsam::Point3(iso.translation())};
+}
+
+geometry_msgs::msg::Vector3 toVector3Msg(const Eigen::Vector3d& v) {
+  geometry_msgs::msg::Vector3 out;
+  out.x = v.x();
+  out.y = v.y();
+  out.z = v.z();
+  return out;
 }
 
 geometry_msgs::msg::Pose gtsamPoseToMsg(const gtsam::Pose3& pose) {
@@ -494,6 +507,10 @@ class GraphBackendNode : public rclcpp::Node {
         "/slam/loop_closures", 10);
     optimized_odom_pub_ =
         create_publisher<nav_msgs::msg::Odometry>("/slam/optimized_odom", 10);
+    // L5-06: typed companion of /slam/optimized_odom carrying the full L5-02
+    // node state (pose + velocity + bias) the front-end predictor resets from.
+    optimized_state_pub_ = create_publisher<graph_slam_msgs::msg::OptimizedState>(
+        "/slam/optimized_state", 10);
     diagnostics_pub_ =
         create_publisher<std_msgs::msg::String>("/slam/diagnostics", 10);
     // EVAL-05: live Sigma_post ellipsoids + GT trajectory.
@@ -524,7 +541,7 @@ class GraphBackendNode : public rclcpp::Node {
     RCLCPP_INFO(get_logger(),
                 "graph_backend up. Subscribing to '%s'. KF thresholds: %.2f m / %.2f rad / "
                 "%.1f s. Publishing /slam/graph_path, /slam/keyframes, /slam/graph_edges, "
-                "/slam/optimized_odom. TF: %s → %s.",
+                "/slam/optimized_odom, /slam/optimized_state. TF: %s → %s.",
                 ndt_odom_topic_.c_str(), kf_dist, kf_angle, kf_time, map_frame_.c_str(),
                 odom_frame_.c_str());
   }
@@ -965,6 +982,20 @@ class GraphBackendNode : public rclcpp::Node {
     opt_odom.pose.pose = gtsamPoseToMsg(latest_map);
     optimized_odom_pub_->publish(opt_odom);
 
+    // L5-06: the same instant as a typed OptimizedState, adding the velocity and
+    // IMU bias that nav_msgs/Odometry cannot carry. This is what the front-end
+    // re-seeds its IMU predictor from, so it must be the SAME estimate the
+    // optimized_odom above reports (both read the freshest iSAM2 solution).
+    const graph::NodeState latest_node = optimizer_.nodeEstimate(kf_index_);
+    graph_slam_msgs::msg::OptimizedState opt_state;
+    opt_state.header.stamp = stamp;
+    opt_state.header.frame_id = map_frame_;
+    opt_state.pose = gtsamPoseToMsg(latest_node.pose);
+    opt_state.velocity = toVector3Msg(latest_node.velocity);
+    opt_state.accel_bias = toVector3Msg(latest_node.bias.accelerometer());
+    opt_state.gyro_bias = toVector3Msg(latest_node.bias.gyroscope());
+    optimized_state_pub_->publish(opt_state);
+
     // map → odom TF: T_map_odom = T_map_base_optimized * T_odom_base_raw⁻¹
     // (ARCHITECTURE §5 REP-105). At keyframe time, last_pose_ == raw odom pose
     // for the same physical position as latest_map, so this gives the
@@ -1293,6 +1324,7 @@ class GraphBackendNode : public rclcpp::Node {
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr edges_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr loop_pub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr optimized_odom_pub_;
+  rclcpp::Publisher<graph_slam_msgs::msg::OptimizedState>::SharedPtr optimized_state_pub_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr diagnostics_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr ellipsoids_pub_;
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr gt_path_pub_;
