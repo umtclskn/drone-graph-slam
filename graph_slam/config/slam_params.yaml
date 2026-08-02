@@ -64,6 +64,16 @@
     min_rotation_deg: 5.0                 # keyframe trigger: rotation since last KF
     publish_debug_clouds: true            # ~/scan_raw + ~/scan_target debug topics
 
+    # L5-07/08 scan-to-submap target (ndt_frontend_node). The last
+    # submap_window_size keyframe clouds, each transformed to its optimized pose
+    # (LIO-SAM's extractSurroundingKeyFrames, adapted), are merged and voxel-
+    # downsampled into the NDT target. submap_enabled=false is the ablation flag:
+    # reproduces the pre-L5-07 single-scan (scan-to-scan) target exactly. N and
+    # leaf are tuned later (L5-09); start values only.
+    submap_enabled: true                  # false = scan-to-scan (ablation)
+    submap_window_size: 8                 # N keyframe clouds held in the window
+    submap_voxel_leaf: 0.3                # m, merged submap cloud downsample leaf
+
     # SLAM-01 keyframe policy (graph_backend_node). OR semantics: a keyframe is
     # due when ANY criterion is met; a non-positive value DISABLES a criterion.
     # Previously launch arguments on graph_backend.launch.py; centralised here so

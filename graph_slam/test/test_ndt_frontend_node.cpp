@@ -26,8 +26,12 @@ namespace {
 
 using PointT = pcl::PointXYZI;
 
-/// Dense cube with good 3D spread: passes the NDT-04 quality gate.
-sensor_msgs::msg::PointCloud2 makeSpreadCloud(const rclcpp::Time& stamp) {
+/// Dense cube with good 3D spread: passes the NDT-04 quality gate. `x_offset`
+/// shifts every point along x, in the cloud's OWN local sensor frame — used by
+/// the L5-07/08 submap tests to synthesize a static cube observed from a
+/// sensor that moved: a real +d world translation makes the static scene
+/// appear shifted by -d in the next scan's local frame.
+sensor_msgs::msg::PointCloud2 makeSpreadCloud(const rclcpp::Time& stamp, float x_offset = 0.0F) {
   pcl::PointCloud<PointT> cloud;
   constexpr int kN = 8;
   constexpr float kSpan = 5.0F;
@@ -36,7 +40,7 @@ sensor_msgs::msg::PointCloud2 makeSpreadCloud(const rclcpp::Time& stamp) {
     for (int j = 0; j < kN; ++j) {
       for (int k = 0; k < kN; ++k) {
         PointT p;
-        p.x = static_cast<float>(i) * kSpan / static_cast<float>(kN - 1);
+        p.x = x_offset + static_cast<float>(i) * kSpan / static_cast<float>(kN - 1);
         p.y = static_cast<float>(j) * kSpan / static_cast<float>(kN - 1);
         p.z = static_cast<float>(k) * kSpan / static_cast<float>(kN - 1);
         p.intensity = 1.0F;
@@ -122,6 +126,10 @@ TEST(NdtFrontendNodeTest, DeclaresDocumentedParameters) {
   EXPECT_DOUBLE_EQ(node->get_parameter("min_translation_m").as_double(), 0.3);
   EXPECT_DOUBLE_EQ(node->get_parameter("min_rotation_deg").as_double(), 5.0);
   EXPECT_TRUE(node->get_parameter("publish_debug_clouds").as_bool());
+  // L5-07/08: scan-to-submap target + its ablation flag.
+  EXPECT_TRUE(node->get_parameter("submap_enabled").as_bool());
+  EXPECT_EQ(node->get_parameter("submap_window_size").as_int(), 8);
+  EXPECT_DOUBLE_EQ(node->get_parameter("submap_voxel_leaf").as_double(), 0.3);
 }
 
 // NDT-11 gate enforcement, no-prior branch: when every registration is
@@ -237,6 +245,136 @@ TEST(NdtFrontendNodeTest, GateRejectSkipsScanEvenWithPrediction) {
   pump();
   EXPECT_EQ(received.size(), 1U)
       << "a rejected registration must not publish the IMU prediction as odometry";
+}
+
+// L5-07/08: node options for the submap scenario below — small motion
+// thresholds so a real (gate-accepted) 0.5 m step advances the keyframe, and
+// otherwise DEFAULT (non-rejecting) gate/quality thresholds, since this
+// scenario needs genuine NDT acceptance rather than the forced-reject trick
+// `rejectingGateOptions()` uses elsewhere in this file.
+rclcpp::NodeOptions submapNodeOptions(bool submap_enabled, int window_size) {
+  rclcpp::NodeOptions options;
+  options.parameter_overrides({
+      {"min_translation_m", 0.1},
+      {"min_rotation_deg", 1.0},
+      {"publish_debug_clouds", false},
+      {"submap_enabled", submap_enabled},
+      {"submap_window_size", window_size},
+      {"submap_voxel_leaf", 0.3},
+      {"use_sim_time", true},
+  });
+  return options;
+}
+
+// L5-07/08: bootstrap + two real, gate-accepted keyframes, each a synthetic
+// exact +0.5 m x-translation (the cube's local-frame points are shifted -0.5 m
+// per step to represent that real motion — see makeSpreadCloud's doc comment
+// — and the IMU predictor is fed the identical constant-velocity segment
+// GateRejectSkipsScanEvenWithPrediction uses, so the NDT init guess is a
+// near-exact match and default gate thresholds accept). By the third scan the
+// target (when submap_enabled) is the L5-07 submap merged from BOTH prior
+// keyframes (window_size=2), exercising the merge/voxel-downsample path, not
+// just the size-1 degenerate case.
+std::vector<nav_msgs::msg::Odometry> runSubmapScenario(bool submap_enabled, int window_size) {
+  constexpr double kGravity = 9.8;
+  constexpr double kVelocity = 1.0;  // m/s along +x
+  constexpr double kStep = 0.05;     // s between IMU samples
+  constexpr int kSamples = 10;       // -> 0.5 s -> 0.5 m per keyframe interval
+
+  rclcpp::NodeOptions options = submapNodeOptions(submap_enabled, window_size);
+  options.append_parameter_override("imu_gravity", kGravity);
+  const auto node = graph_slam::createNdtFrontendNode(options);
+
+  auto helper = rclcpp::Node::make_shared("submap_test_helper");
+  auto clock_pub = helper->create_publisher<rosgraph_msgs::msg::Clock>("/clock", 10);
+  auto scan_pub = helper->create_publisher<sensor_msgs::msg::PointCloud2>(
+      node->get_parameter("lidar_topic").as_string(), 10);
+  auto imu_pub = helper->create_publisher<sensor_msgs::msg::Imu>(
+      node->get_parameter("imu_topic").as_string(), rclcpp::SensorDataQoS());
+  auto state_pub = helper->create_publisher<graph_slam_msgs::msg::OptimizedState>(
+      node->get_parameter("optimized_state_topic").as_string(), 10);
+  std::vector<nav_msgs::msg::Odometry> received;
+  auto odom_sub = helper->create_subscription<nav_msgs::msg::Odometry>(
+      "/ndt_frontend/ndt_odom", 10,
+      [&received](nav_msgs::msg::Odometry::ConstSharedPtr msg) { received.push_back(*msg); });
+
+  rclcpp::executors::SingleThreadedExecutor exec;
+  exec.add_node(node);
+  exec.add_node(helper);
+  auto pump = [&exec] {
+    for (int i = 0; i < 30; ++i) {
+      exec.spin_some(std::chrono::milliseconds(10));
+    }
+  };
+  double sim_t = 2000.0;
+  auto tick = [&](double dt) {
+    sim_t += dt;
+    rosgraph_msgs::msg::Clock clock;
+    clock.clock = rclcpp::Time(static_cast<int64_t>(sim_t * 1e9), RCL_ROS_TIME);
+    clock_pub->publish(clock);
+    pump();
+  };
+  auto feedImuSegment = [&] {
+    for (int i = 0; i < kSamples; ++i) {
+      tick(kStep);
+      imu_pub->publish(makeLevelImu(node->now(), kGravity));
+      pump();
+    }
+  };
+
+  tick(0.0);
+  state_pub->publish(makeOptimizedState(node->now(), kVelocity));  // anchor the predictor
+  pump();
+  imu_pub->publish(makeLevelImu(node->now(), kGravity));  // primes last_imu_stamp_
+  pump();
+
+  scan_pub->publish(makeSpreadCloud(node->now(), 0.0F));  // bootstrap -> kf0
+  pump();
+
+  feedImuSegment();                                        // predicts +0.5 m
+  scan_pub->publish(makeSpreadCloud(node->now(), -0.5F));  // real +0.5 m -> kf1
+  pump();
+
+  feedImuSegment();                                         // predicts +0.5 m more
+  scan_pub->publish(makeSpreadCloud(node->now(), -1.0F));  // real +0.5 m; registers
+                                                             // against the (possibly
+                                                             // 2-keyframe) submap
+  pump();
+
+  return received;
+}
+
+TEST(NdtFrontendNodeTest, ScanToSubmapWindowGrowsAndIsDeterministic) {
+  const auto run1 = runSubmapScenario(/*submap_enabled=*/true, /*window_size=*/2);
+  const auto run2 = runSubmapScenario(/*submap_enabled=*/true, /*window_size=*/2);
+
+  ASSERT_EQ(run1.size(), 3U) << "bootstrap + two real accepted keyframes expected";
+  ASSERT_EQ(run2.size(), 3U);
+
+  // L5-07d: given fixed clouds + poses, the built submap (and everything
+  // downstream of it) is reproducible run to run.
+  for (std::size_t i = 0; i < run1.size(); ++i) {
+    EXPECT_NEAR(run1[i].pose.pose.position.x, run2[i].pose.pose.position.x, 1e-6) << "msg " << i;
+    EXPECT_NEAR(run1[i].pose.pose.position.y, run2[i].pose.pose.position.y, 1e-6) << "msg " << i;
+    EXPECT_NEAR(run1[i].pose.pose.position.z, run2[i].pose.pose.position.z, 1e-6) << "msg " << i;
+  }
+
+  // Each accepted keyframe recovered close to the true 0.5 m x-translation
+  // baked into the synthetic clouds: registering against the merged 2-keyframe
+  // submap (message 3) did not silently break registration.
+  EXPECT_NEAR(run1[1].pose.pose.position.x, 0.5, 0.05);
+  EXPECT_NEAR(run1[2].pose.pose.position.x, 1.0, 0.05);
+}
+
+TEST(NdtFrontendNodeTest, SubmapAblationDisabledStillRegistersCorrectly) {
+  // L5-08a ablation flag: submap_enabled=false must fall back to the old
+  // single-scan target end to end (no merge, no crash) and still recover the
+  // same true translations as the submap-enabled run above.
+  const auto run = runSubmapScenario(/*submap_enabled=*/false, /*window_size=*/2);
+
+  ASSERT_EQ(run.size(), 3U);
+  EXPECT_NEAR(run[1].pose.pose.position.x, 0.5, 0.05);
+  EXPECT_NEAR(run[2].pose.pose.position.x, 1.0, 0.05);
 }
 
 }  // namespace

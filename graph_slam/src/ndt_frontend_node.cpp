@@ -2,7 +2,7 @@
 //
 // Per scan (ARCHITECTURE §4 order):
 //   LiDAR -> Preprocessor -> QualityChecker (NDT-04, reject -> log + skip)
-//         -> NdtVoxelGrid (target = current keyframe) -> NdtRegistrar.align
+//         -> NdtVoxelGrid (target = L5-07/08 submap, see below) -> NdtRegistrar.align
 //            (L5-06 IMU-predicted initial guess) -> NDT-11 gate ENFORCED:
 //            non-Reliable -> predicted-delta fallback (or skip when no prediction)
 //         -> NDT-12 Sigma_meas -> publish ~/ndt_odom.
@@ -15,10 +15,24 @@
 // is the relative pose between the prediction latched at the current keyframe
 // and the prediction at this scan — LIO-SAM's imuIntegratorImu_ role.
 //
+// L5-07/08 scan-to-submap target (LIO-SAM's extractSurroundingKeyFrames,
+// adapted): the last `submap_window_size` keyframe clouds are held in
+// `submap_keyframes_`, each tagged with the best pose estimate available for it
+// (IMU-predicted at creation, refined to the back-end's OPTIMIZED pose once its
+// /slam/optimized_state arrives — see onOptimizedState). rebuildTargetGrid()
+// transforms every windowed cloud into the newest keyframe's frame (via
+// relativePoseGuess on those anchor-frame poses — the same relative-motion trick
+// the L5-06 guess already uses, so no new frame plumbing), merges, voxel-
+// downsamples, and rebuilds the NDT target grid. `submap_enabled=false` (the
+// ablation flag) degrades this to the old single-scan target exactly (a size-1
+// window transformed by identity). Sliding-window eviction is fixed-N (YAML
+// `submap_window_size`); N tuning (L5-09) and loop-closure submap rebuild
+// (L5-10) are deferred.
+//
 // Keyframe policy (simple, YAGNI): the first accepted scan is the keyframe; each
-// later scan is registered against it, but ~/ndt_odom is only published (and the
-// keyframe advanced) once the measured motion exceeds a translation/rotation
-// threshold. Standing still -> no new keyframe -> no new odom message.
+// later scan is registered against the target, but ~/ndt_odom is only published
+// (and the keyframe advanced) once the measured motion exceeds a translation/
+// rotation threshold. Standing still -> no new keyframe -> no new odom message.
 //
 // The algorithm classes stay ROS-free; only THIS executable links ROS. No map
 // management, no loop closure. TF (INFRA-01): odom->base_link here; map->odom and
@@ -27,11 +41,13 @@
 #include "ndt_frontend_node.hpp"
 
 #include <pcl/common/transforms.h>
+#include <pcl/filters/voxel_grid.h>
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <Eigen/Geometry>
 #include <array>
 #include <cmath>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -109,6 +125,15 @@ std::array<double, 36> sigmaToNavCovariance(const Matrix6f& sigma) {
   return cov;
 }
 
+/// L5-07: one entry in the scan-to-submap sliding window — a keyframe's
+/// preprocessed cloud (its own local sensor frame) plus the best pose estimate
+/// available for it: IMU-predicted at creation, refined to the back-end's
+/// OPTIMIZED pose once /slam/optimized_state for this keyframe arrives.
+struct SubmapKeyframe {
+  CloudPtr cloud;
+  Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
+};
+
 class NdtFrontendNode : public rclcpp::Node {
  public:
   explicit NdtFrontendNode(rclcpp::NodeOptions options)
@@ -126,6 +151,12 @@ class NdtFrontendNode : public rclcpp::Node {
     min_translation_m_ = declare_parameter<double>("min_translation_m", 0.3);
     min_rotation_deg_ = declare_parameter<double>("min_rotation_deg", 5.0);
     publish_debug_clouds_ = declare_parameter<bool>("publish_debug_clouds", true);
+    // L5-07/08: scan-to-submap target. submap_enabled=false is the ablation flag
+    // (reproduces the pre-L5-07 single-scan target exactly). window_size = N
+    // keyframe clouds held; voxel_leaf downsamples the merged submap cloud.
+    submap_enabled_ = declare_parameter<bool>("submap_enabled", submap_enabled_);
+    submap_window_size_ = declare_parameter<int>("submap_window_size", submap_window_size_);
+    submap_voxel_leaf_ = declare_parameter<double>("submap_voxel_leaf", submap_voxel_leaf_);
     // Pipeline knobs (INFRA-02); defaults equal the struct defaults, so a YAML edit
     // changes behaviour without a rebuild.
     pre_cfg_.voxel_leaf = static_cast<float>(declare_parameter<double>("voxel_leaf", 0.2));
@@ -186,10 +217,13 @@ class NdtFrontendNode : public rclcpp::Node {
 
     RCLCPP_INFO(get_logger(),
                 "ndt_frontend up. LiDAR '%s', IMU guess from '%s' anchored on '%s'. "
-                "keyframe at >%.2f m / >%.1f deg; debug_clouds=%d. Publishing %s/ndt_odom.",
+                "keyframe at >%.2f m / >%.1f deg; debug_clouds=%d. target=%s (N=%d, "
+                "leaf=%.2f m). Publishing %s/ndt_odom.",
                 lidar_topic_.c_str(), imu_topic_.c_str(), optimized_state_topic_.c_str(),
                 min_translation_m_, min_rotation_deg_,
-                static_cast<int>(publish_debug_clouds_), get_fully_qualified_name());
+                static_cast<int>(publish_debug_clouds_),
+                submap_enabled_ ? "scan-to-submap" : "scan-to-scan", submap_window_size_,
+                submap_voxel_leaf_, get_fully_qualified_name());
   }
 
  private:
@@ -242,6 +276,14 @@ class NdtFrontendNode : public rclcpp::Node {
     // scope here.)
     if (have_keyframe_) {
       predicted_at_keyframe_ = predictedPose();
+      // L5-07c: this optimized state is the back-end's take on the CURRENT
+      // (newest) keyframe (see the comment above), so it refines that window
+      // entry's pose from "IMU-predicted at creation" to "back-end optimized" —
+      // the submap must be rebuilt so it reflects the corrected pose.
+      if (!submap_keyframes_.empty()) {
+        submap_keyframes_.back().pose = *predicted_at_keyframe_;
+        rebuildTargetGrid();
+      }
     }
     if (first) {
       RCLCPP_INFO(get_logger(), "IMU predictor anchored on '%s' (first optimized state).",
@@ -296,7 +338,7 @@ class NdtFrontendNode : public rclcpp::Node {
     }
 
     const RegistrationResult result =
-        NdtRegistrar{ndt_cfg_}.align(*keyframe_grid_, scan, init_guess);
+        NdtRegistrar{ndt_cfg_}.align(*target_grid_, scan, init_guess);
     const RegistrationStatus verdict = evaluateRegistration(result, gate_cfg_);
 
     // NDT-11 gate ENFORCEMENT: a rejected registration must not enter the
@@ -339,18 +381,60 @@ class NdtFrontendNode : public rclcpp::Node {
     setKeyframe(scan, world_from_current, predicted, msg->header);
   }
 
-  // Promote `scan` to the active keyframe: rebuild the NDT target grid, store its
-  // world pose, and latch the IMU prediction at this instant as the reference
-  // end of the next scan's guess.
+  // Promote `scan` to the active keyframe: push it (with its current best pose
+  // estimate) onto the L5-07 submap window, evict beyond the window size,
+  // rebuild the fused NDT target grid, store the world pose, and latch the IMU
+  // prediction at this instant as the reference end of the next scan's guess.
   void setKeyframe(const CloudPtr& scan, const Eigen::Matrix4f& world_pose,
                    const std::optional<Eigen::Matrix4f>& predicted,
                    const std_msgs::msg::Header& header) {
-    keyframe_grid_ = std::make_unique<NdtVoxelGrid>(grid_cfg_);
-    keyframe_grid_->build(scan);
     world_from_keyframe_ = world_pose;
     have_keyframe_ = true;
     predicted_at_keyframe_ = predicted;
+
+    submap_keyframes_.push_back(
+        SubmapKeyframe{scan, predicted.value_or(Eigen::Matrix4f::Identity())});
+    while (submap_keyframes_.size() > static_cast<std::size_t>(submap_window_size_)) {
+      submap_keyframes_.pop_front();
+    }
+    rebuildTargetGrid();
+
     publishCloud(scan_target_pub_, scan, header);
+  }
+
+  // L5-07c/L5-08a: fuse the sliding window into ONE NDT target grid. Every
+  // windowed cloud is transformed from its own local sensor frame into the
+  // newest (reference) keyframe's frame via relativePoseGuess() on the two
+  // keyframes' anchor-frame poses — the identical "relative motion from two
+  // absolute predicted poses" trick the L5-06 init guess already relies on, so
+  // this introduces no new frame convention. submap_enabled_=false (ablation)
+  // or a size-1 window both degrade to exactly the old single-scan target (the
+  // reference keyframe transformed by identity).
+  void rebuildTargetGrid() {
+    target_grid_ = std::make_unique<NdtVoxelGrid>(grid_cfg_);
+    if (submap_keyframes_.empty()) {
+      return;
+    }
+    if (!submap_enabled_ || submap_keyframes_.size() == 1) {
+      target_grid_->build(submap_keyframes_.back().cloud);
+      return;
+    }
+
+    const Eigen::Matrix4f pose_ref = submap_keyframes_.back().pose;
+    auto merged = std::make_shared<Cloud>();
+    for (const auto& kf : submap_keyframes_) {
+      Cloud transformed;
+      pcl::transformPointCloud(*kf.cloud, transformed, relativePoseGuess(pose_ref, kf.pose));
+      *merged += transformed;
+    }
+
+    pcl::VoxelGrid<PointT> voxel;
+    voxel.setInputCloud(merged);
+    const auto leaf = static_cast<float>(submap_voxel_leaf_);
+    voxel.setLeafSize(leaf, leaf, leaf);
+    auto downsampled = std::make_shared<Cloud>();
+    voxel.filter(*downsampled);
+    target_grid_->build(downsampled);
   }
 
   void publishOdom(const Eigen::Matrix4f& world_from_base, const Matrix6f& sigma,
@@ -395,6 +479,9 @@ class NdtFrontendNode : public rclcpp::Node {
   double min_translation_m_ = 0.3;
   double min_rotation_deg_ = 5.0;
   bool publish_debug_clouds_ = true;
+  bool submap_enabled_ = true;      // L5-07/08 ablation flag; false = scan-to-scan
+  int submap_window_size_ = 8;      // N keyframe clouds held in the submap window
+  double submap_voxel_leaf_ = 0.3;  // m, merged submap cloud downsample leaf
   PreprocessConfig pre_cfg_;
   NdtGridConfig grid_cfg_;
   NdtConfig ndt_cfg_;
@@ -403,9 +490,13 @@ class NdtFrontendNode : public rclcpp::Node {
   imu::PreintegrationConfig predictor_cfg_;
 
   // state
-  std::unique_ptr<NdtVoxelGrid> keyframe_grid_;
+  std::unique_ptr<NdtVoxelGrid> target_grid_;
   Eigen::Matrix4f world_from_keyframe_ = Eigen::Matrix4f::Identity();
   bool have_keyframe_ = false;
+
+  // L5-07 submap sliding window: last submap_window_size_ keyframe clouds, each
+  // tagged with its best-known map-frame pose (see rebuildTargetGrid()).
+  std::deque<SubmapKeyframe> submap_keyframes_;
 
   // L5-06 IMU predictor: a second ImuPreintegrator (the back-end owns the one
   // that feeds the ImuFactor) dead-reckoning from the latest optimized state.
