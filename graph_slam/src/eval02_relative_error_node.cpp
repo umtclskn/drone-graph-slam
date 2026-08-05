@@ -111,6 +111,12 @@ class Eval02RelativeErrorNode : public rclcpp::Node {
         declare_parameter<double>("gate_min_hessian_eigenvalue", gate_cfg_.min_hessian_eigenvalue);
     gate_cfg_.max_condition_number =
         declare_parameter<double>("gate_max_condition_number", gate_cfg_.max_condition_number);
+    gate_cfg_.min_scored_fraction =
+        declare_parameter<double>("gate_min_scored_fraction", gate_cfg_.min_scored_fraction);
+    gate_cfg_.max_guess_delta_t =
+        declare_parameter<double>("gate_max_guess_delta_t", gate_cfg_.max_guess_delta_t);
+    gate_cfg_.max_guess_delta_rot =
+        declare_parameter<double>("gate_max_guess_delta_rot", gate_cfg_.max_guess_delta_rot);
     // Register pair (i, i+stride) for i = 0, stride, 2*stride, ...; stride=1 is
     // every consecutive pair. max_pairs caps the count (0 = all). idle_sec is how
     // long with no new scan before the finalize pass runs.

@@ -21,9 +21,11 @@ namespace graph_slam::imu {
 // One IMU reading already expressed in the body frame the SLAM stack uses
 // (FLU base_link, right-handed, consistent with the ENU world — ARCHITECTURE §5).
 // `stamp_s` is the sample time in seconds *in the SLAM clock domain* (sim time on
-// bag replay); the backend node re-stamps with its own clock because
-// px4_offboard/imu_bridge.py forwards PX4 wall-clock stamps. `accel` is the
-// measured specific force [m/s^2]; `gyro` is the measured angular rate [rad/s].
+// bag replay). Post-L5-17i the bridge already publishes /imu/data in that domain
+// (node clock under use_sim_time; OS-time pass-through on real hardware), so the
+// backend keys the window buffer by the message HEADER stamp directly. `accel`
+// is the measured specific force [m/s^2]; `gyro` is the measured angular rate
+// [rad/s].
 struct ImuSample {
   double stamp_s{0.0};
   Eigen::Vector3d accel{Eigen::Vector3d::Zero()};

@@ -13,9 +13,10 @@ Usage:
 Outputs: ~/ndt_odom (nav_msgs/Odometry, T_odom_base + Sigma_meas), odom->base_link TF,
 plus optional ~/scan_raw and ~/scan_target debug clouds.
 
-L5-06: the NDT initial guess is IMU-predicted, so the front-end needs /imu/data
-(px4_offboard imu_bridge) and /slam/optimized_state (graph_backend_node) to be
-live; without them the guess degrades to identity.
+L5-18: the NDT initial guess comes from PX4 EKF2, so the front-end needs
+/odometry/ekf2 (px4_offboard ekf2_odometry_adapter) to be live; without it the
+guess degrades to identity. It subscribes to NO back-end topic, by design — an
+independent guess source is what keeps the graph out of its own seed.
 
 Static TF (launch file):
   map -> odom          identity stub until Sprint 3 GTSAM back-end owns map->odom

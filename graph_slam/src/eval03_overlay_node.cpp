@@ -92,6 +92,12 @@ class Eval03OverlayNode : public rclcpp::Node {
         declare_parameter<double>("gate_min_hessian_eigenvalue", gate_cfg_.min_hessian_eigenvalue);
     gate_cfg_.max_condition_number =
         declare_parameter<double>("gate_max_condition_number", gate_cfg_.max_condition_number);
+    gate_cfg_.min_scored_fraction =
+        declare_parameter<double>("gate_min_scored_fraction", gate_cfg_.min_scored_fraction);
+    gate_cfg_.max_guess_delta_t =
+        declare_parameter<double>("gate_max_guess_delta_t", gate_cfg_.max_guess_delta_t);
+    gate_cfg_.max_guess_delta_rot =
+        declare_parameter<double>("gate_max_guess_delta_rot", gate_cfg_.max_guess_delta_rot);
     // Set frame_id to the frame your scans are published in. Only publish our own
     // static TF when nothing else does (e.g. replaying a bag with no /tf); with a
     // live sim that already publishes the lidar frame, set publish_tf:=false.

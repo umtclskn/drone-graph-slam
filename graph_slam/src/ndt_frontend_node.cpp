@@ -3,31 +3,48 @@
 // Per scan (ARCHITECTURE §4 order):
 //   LiDAR -> Preprocessor -> QualityChecker (NDT-04, reject -> log + skip)
 //         -> NdtVoxelGrid (target = L5-07/08 submap, see below) -> NdtRegistrar.align
-//            (L5-06 IMU-predicted initial guess) -> NDT-11 gate ENFORCED:
-//            non-Reliable -> predicted-delta fallback (or skip when no prediction)
+//            (L5-18 EKF2-sourced initial guess) -> NDT-11 gate ENFORCED:
+//            non-Reliable -> skip the scan (recovery policy is L5-13)
 //         -> NDT-12 Sigma_meas -> publish ~/ndt_odom.
 //
-// L5-06 initial guess: the EKF2 delta is gone. This node runs a SECOND instance
-// of the ROS-free graph_slam::imu::ImuPreintegrator (the back-end owns the first
-// one, for the ImuFactor) purely as a dead-reckoning predictor: it integrates
-// /imu/data continuously and is re-seeded from the back-end's optimized
-// (pose, velocity, bias) on every /slam/optimized_state message. The NDT guess
-// is the relative pose between the prediction latched at the current keyframe
-// and the prediction at this scan — LIO-SAM's imuIntegratorImu_ role.
+// L5-18 initial guess (reverses L5-06): the guess is the relative motion between
+// two PX4 EKF2 poses, T_guess = T_ekf2(t_keyframe)^-1 * T_ekf2(t_scan), looked up
+// by header stamp from a time-ordered buffer of /odometry/ekf2. EKF2 is fed by
+// IMU inside PX4 firmware and consumes NO graph_slam output, so it cannot form a
+// `guess -> NDT -> backend_state -> guess` cycle; L5-06's back-end-anchored IMU
+// predictor could, and measurably regressed the front-end (L5-06d: ATE
+// 0.710 -> 1.036 m; XY diagnosis: XY 0.192 -> 0.647 m). EKF2's own unbounded
+// indoor drift does not matter here because only a DIFFERENCE over one
+// keyframe->scan interval is used, so slow drift cancels.
+// This node holds no IMU integrator. EKF2 is a guess and only a guess: not a
+// graph factor, not a gate fallback, not a bootstrap prior. L5-19 re-subscribes
+// to /slam/optimized_state solely to pose the submap target — never the guess.
 //
-// L5-07/08 scan-to-submap target (LIO-SAM's extractSurroundingKeyFrames,
+// graph_slam stays PX4-agnostic: /odometry/ekf2 is standard nav_msgs/Odometry,
+// published by px4_offboard/ekf2_odometry_adapter.py (PX4-01), which is the one
+// sanctioned px4_msgs boundary (ARCHITECTURE §3/§11). Its header stamp is already
+// in the SLAM clock domain (sim time under use_sim_time), so this node uses that
+// stamp verbatim and never re-stamps with its own clock.
+//
+// L5-07/08/19 scan-to-submap target (LIO-SAM's extractSurroundingKeyFrames,
 // adapted): the last `submap_window_size` keyframe clouds are held in
-// `submap_keyframes_`, each tagged with the best pose estimate available for it
-// (IMU-predicted at creation, refined to the back-end's OPTIMIZED pose once its
-// /slam/optimized_state arrives — see onOptimizedState). rebuildTargetGrid()
-// transforms every windowed cloud into the newest keyframe's frame (via
-// relativePoseGuess on those anchor-frame poses — the same relative-motion trick
-// the L5-06 guess already uses, so no new frame plumbing), merges, voxel-
-// downsamples, and rebuilds the NDT target grid. `submap_enabled=false` (the
-// ablation flag) degrades this to the old single-scan target exactly (a size-1
-// window transformed by identity). Sliding-window eviction is fixed-N (YAML
-// `submap_window_size`); N tuning (L5-09) and loop-closure submap rebuild
-// (L5-10) are deferred.
+// `submap_keyframes_`. New entries start with this node's NDT pose
+// (`world_from_keyframe_`, unrefined); `/slam/optimized_state` later replaces
+// each matching entry's pose by exact stamp/id (L5-19). rebuildTargetGrid()
+// fuses only same-source poses (never refined+unrefined together). The NDT
+// initial guess stays on EKF2 and never reads optimized_state (L5-18).
+// `submap_enabled=false` degrades to the old single-scan target. Sliding-window
+// eviction is fixed-N (YAML `submap_window_size`); N tuning is L5-09.
+//
+// L5-10 loop-closure rebuild: on `/slam/optimized_state_batch` (published once
+// per accepted closure, covering the whole re-optimized keyframe range),
+// onOptimizedStateBatch() applies every entry to the window in ONE atomic pass
+// (applyOptimizedPoseBatch) — never the collapse-inducing N-independent-
+// publishes path L5-12 measured and reverted — and rebuilds the target grid
+// once if the max pose shift crosses (`submap_rebuild_eps_m`,
+// `submap_rebuild_eps_rad`). L5-19e's per-entry collapse-on-jump guard is
+// unchanged and still applies to the ordinary single-keyframe
+// `/slam/optimized_state` path above.
 //
 // Keyframe policy (simple, YAGNI): the first accepted scan is the keyframe; each
 // later scan is registered against the target, but ~/ndt_odom is only published
@@ -45,29 +62,28 @@
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <Eigen/Geometry>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <deque>
 #include <memory>
 #include <optional>
 #include <utility>
+#include <geometry_msgs/msg/pose.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
-#include <graph_slam_msgs/msg/optimized_state.hpp>
-#include <gtsam/geometry/Pose3.h>
-#include <gtsam/geometry/Rot3.h>
-#include <gtsam/navigation/ImuBias.h>
-#include <gtsam/navigation/NavState.h>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
 #include <string>
 #include <tf2_ros/transform_broadcaster.h>
+#include <vector>
 // NOTE: header paths are FLAT (graph_slam/foo.hpp) except the two already migrated
 // to ARCHITECTURE §3 subdirs (preprocess/, eval/). The package layout is only
 // half-migrated; finishing it is a separate cleanup story (see NDT-13 log). These
 // includes match where the files actually live today.
-#include "graph_slam/imu/imu_preintegrator.hpp"
+#include <graph_slam_msgs/msg/optimized_state.hpp>
+#include <graph_slam_msgs/msg/optimized_state_batch.hpp>
+
 #include "graph_slam/initial_guess.hpp"
 #include "graph_slam/ndt_registrar.hpp"
 #include "graph_slam/ndt_voxel_grid.hpp"
@@ -76,6 +92,7 @@
 #include "graph_slam/preprocessor.hpp"
 #include "graph_slam/registration_gate.hpp"
 #include "graph_slam/registration_result.hpp"
+#include "graph_slam/submap_pose_policy.hpp"
 
 namespace graph_slam {
 namespace {
@@ -93,17 +110,17 @@ geometry_msgs::msg::Pose matrixToPose(const Eigen::Matrix4f& m) {
   return p;
 }
 
-/// L5-06: the IMU predictor works in gtsam::Pose3 (double, GTSAM NavState); the
-/// NDT pipeline works in Eigen::Matrix4f. One conversion at the boundary.
-Eigen::Matrix4f gtsamPoseToMatrix(const gtsam::Pose3& pose) {
+/// L5-18: EKF2 arrives as a ROS pose; the NDT pipeline works in Eigen::Matrix4f.
+/// One conversion at the boundary.
+Eigen::Matrix4f poseToMatrix(const geometry_msgs::msg::Pose& p) {
+  const Eigen::Quaternionf q(static_cast<float>(p.orientation.w), static_cast<float>(p.orientation.x),
+                             static_cast<float>(p.orientation.y), static_cast<float>(p.orientation.z));
   Eigen::Matrix4f m = Eigen::Matrix4f::Identity();
-  m.block<3, 3>(0, 0) = pose.rotation().matrix().cast<float>();
-  m.block<3, 1>(0, 3) = pose.translation().cast<float>();
+  m.block<3, 3>(0, 0) = q.normalized().toRotationMatrix();
+  m(0, 3) = static_cast<float>(p.position.x);
+  m(1, 3) = static_cast<float>(p.position.y);
+  m(2, 3) = static_cast<float>(p.position.z);
   return m;
-}
-
-Eigen::Vector3d toEigen(const geometry_msgs::msg::Vector3& v) {
-  return {v.x, v.y, v.z};
 }
 
 /// Rotation angle (rad) encoded by the 3x3 block of an SE(3) matrix.
@@ -125,12 +142,12 @@ std::array<double, 36> sigmaToNavCovariance(const Matrix6f& sigma) {
   return cov;
 }
 
-/// L5-07: one entry in the scan-to-submap sliding window — a keyframe's
-/// preprocessed cloud (its own local sensor frame) plus the best pose estimate
-/// available for it: IMU-predicted at creation, refined to the back-end's
-/// OPTIMIZED pose once /slam/optimized_state for this keyframe arrives.
-struct SubmapKeyframe {
-  CloudPtr cloud;
+/// L5-18: one buffered PX4 EKF2 pose, keyed by the message's ORIGINAL header
+/// stamp. The stamp is used verbatim — never re-stamped with the node clock —
+/// because px4_offboard's ekf2_odometry_adapter already publishes in the SLAM
+/// clock domain (sim time under use_sim_time), the domain the scan headers use.
+struct Ekf2Sample {
+  double stamp_s = 0.0;
   Eigen::Matrix4f pose = Eigen::Matrix4f::Identity();
 };
 
@@ -139,13 +156,23 @@ class NdtFrontendNode : public rclcpp::Node {
   explicit NdtFrontendNode(rclcpp::NodeOptions options)
       : rclcpp::Node("ndt_frontend", options) {
     lidar_topic_ = declare_parameter<std::string>("lidar_topic", "/x500/lidar_3d/points");
-    // L5-06: the guess inputs — raw IMU to dead-reckon with, and the back-end's
-    // optimized state to re-seed from. Same /imu/data the back-end consumes
-    // (sensor_msgs/Imu from px4_offboard/imu_bridge.py, FLU base_link) — a
-    // second subscriber to a standard message keeps graph_slam PX4-agnostic.
-    imu_topic_ = declare_parameter<std::string>("imu_topic", "/imu/data");
+    // L5-18: the ONLY motion input — PX4 EKF2 odometry, republished as standard
+    // nav_msgs/Odometry (ENU) by px4_offboard/ekf2_odometry_adapter, so graph_slam
+    // sees no px4_msgs. Independent of the graph by construction: EKF2 runs inside
+    // PX4 firmware and consumes nothing this package publishes.
+    ekf2_topic_ = declare_parameter<std::string>("ekf2_topic", "/odometry/ekf2");
+    ekf2_buffer_seconds_ =
+        declare_parameter<double>("ekf2_buffer_seconds", ekf2_buffer_seconds_);
+    ekf2_max_time_diff_s_ =
+        declare_parameter<double>("ekf2_max_time_diff_s", ekf2_max_time_diff_s_);
+    // L5-19: submap pose feed only — never used for the NDT initial guess.
     optimized_state_topic_ =
         declare_parameter<std::string>("optimized_state_topic", "/slam/optimized_state");
+    // L5-10: coordinated batch feed, published once per accepted loop closure —
+    // see onOptimizedStateBatch() for why this is a SEPARATE topic from the
+    // per-keyframe one above rather than N single-entry messages.
+    optimized_state_batch_topic_ = declare_parameter<std::string>(
+        "optimized_state_batch_topic", "/slam/optimized_state_batch");
     odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
     base_frame_ = declare_parameter<std::string>("base_frame", "base_link");
     min_translation_m_ = declare_parameter<double>("min_translation_m", 0.3);
@@ -157,6 +184,18 @@ class NdtFrontendNode : public rclcpp::Node {
     submap_enabled_ = declare_parameter<bool>("submap_enabled", submap_enabled_);
     submap_window_size_ = declare_parameter<int>("submap_window_size", submap_window_size_);
     submap_voxel_leaf_ = declare_parameter<double>("submap_voxel_leaf", submap_voxel_leaf_);
+    submap_collapse_eps_m_ =
+        declare_parameter<double>("submap_collapse_eps_m", submap_collapse_eps_m_);
+    submap_collapse_eps_rad_ =
+        declare_parameter<double>("submap_collapse_eps_rad", submap_collapse_eps_rad_);
+    // L5-10: loop-closure coordinated-rebuild thresholds. A batch's max pose
+    // shift among already-refined window entries must exceed EITHER of these
+    // before rebuildTargetGrid() is called again (thrashing guard — most
+    // closures nudge already-accurate poses by a few mm/mrad).
+    submap_rebuild_eps_m_ =
+        declare_parameter<double>("submap_rebuild_eps_m", submap_rebuild_eps_m_);
+    submap_rebuild_eps_rad_ =
+        declare_parameter<double>("submap_rebuild_eps_rad", submap_rebuild_eps_rad_);
     // Pipeline knobs (INFRA-02); defaults equal the struct defaults, so a YAML edit
     // changes behaviour without a rebuild.
     pre_cfg_.voxel_leaf = static_cast<float>(declare_parameter<double>("voxel_leaf", 0.2));
@@ -182,20 +221,15 @@ class NdtFrontendNode : public rclcpp::Node {
         declare_parameter<double>("gate_min_hessian_eigenvalue", gate_cfg_.min_hessian_eigenvalue);
     gate_cfg_.max_condition_number =
         declare_parameter<double>("gate_max_condition_number", gate_cfg_.max_condition_number);
+    gate_cfg_.min_scored_fraction =
+        declare_parameter<double>("gate_min_scored_fraction", gate_cfg_.min_scored_fraction);
+    gate_cfg_.max_guess_delta_t =
+        declare_parameter<double>("gate_max_guess_delta_t", gate_cfg_.max_guess_delta_t);
+    gate_cfg_.max_guess_delta_rot =
+        declare_parameter<double>("gate_max_guess_delta_rot", gate_cfg_.max_guess_delta_rot);
     quality_cfg_.min_points = declare_parameter<int>("quality_min_points", quality_cfg_.min_points);
     quality_cfg_.min_spread_eigenvalue = declare_parameter<double>(
         "quality_min_spread_eigenvalue", quality_cfg_.min_spread_eigenvalue);
-    // L5-06: the predictor reads the SAME imu_* keys as the back-end's
-    // preintegrator (slam_params.yaml applies them to every node via `/**`), so
-    // both integrators share one noise/gravity definition by construction.
-    predictor_cfg_.accel_noise_sigma =
-        declare_parameter<double>("imu_accel_noise_sigma", predictor_cfg_.accel_noise_sigma);
-    predictor_cfg_.gyro_noise_sigma =
-        declare_parameter<double>("imu_gyro_noise_sigma", predictor_cfg_.gyro_noise_sigma);
-    predictor_cfg_.integration_sigma =
-        declare_parameter<double>("imu_integration_sigma", predictor_cfg_.integration_sigma);
-    predictor_cfg_.gravity = declare_parameter<double>("imu_gravity", predictor_cfg_.gravity);
-    predictor_.emplace(predictor_cfg_);
 
     odom_pub_ = create_publisher<nav_msgs::msg::Odometry>("~/ndt_odom", 10);
     tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -206,20 +240,31 @@ class NdtFrontendNode : public rclcpp::Node {
     scan_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
         lidar_topic_, rclcpp::SensorDataQoS(),
         [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) { onScan(msg); });
-    imu_sub_ = create_subscription<sensor_msgs::msg::Imu>(
-        imu_topic_, rclcpp::SensorDataQoS(),
-        [this](sensor_msgs::msg::Imu::ConstSharedPtr msg) { onImu(msg); });
+    ekf2_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+        ekf2_topic_, rclcpp::QoS(50),
+        [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) { onEkf2(msg); });
+    // L5-19: submap pose refinement only. The NDT guess path never reads this.
     optimized_state_sub_ = create_subscription<graph_slam_msgs::msg::OptimizedState>(
         optimized_state_topic_, rclcpp::QoS(10),
         [this](graph_slam_msgs::msg::OptimizedState::ConstSharedPtr msg) {
           onOptimizedState(msg);
         });
+    // L5-10: coordinated loop-closure submap rebuild. Separate topic/handler
+    // from the per-keyframe one above — see onOptimizedStateBatch().
+    optimized_state_batch_sub_ =
+        create_subscription<graph_slam_msgs::msg::OptimizedStateBatch>(
+            optimized_state_batch_topic_, rclcpp::QoS(10),
+            [this](graph_slam_msgs::msg::OptimizedStateBatch::ConstSharedPtr msg) {
+              onOptimizedStateBatch(msg);
+            });
 
     RCLCPP_INFO(get_logger(),
-                "ndt_frontend up. LiDAR '%s', IMU guess from '%s' anchored on '%s'. "
+                "ndt_frontend up. LiDAR '%s', NDT guess from EKF2 '%s' (buffer %.1f s, "
+                "match tol %.0f ms; guess independent of graph). submap poses from '%s'. "
                 "keyframe at >%.2f m / >%.1f deg; debug_clouds=%d. target=%s (N=%d, "
                 "leaf=%.2f m). Publishing %s/ndt_odom.",
-                lidar_topic_.c_str(), imu_topic_.c_str(), optimized_state_topic_.c_str(),
+                lidar_topic_.c_str(), ekf2_topic_.c_str(), ekf2_buffer_seconds_,
+                ekf2_max_time_diff_s_ * 1e3, optimized_state_topic_.c_str(),
                 min_translation_m_, min_rotation_deg_,
                 static_cast<int>(publish_debug_clouds_),
                 submap_enabled_ ? "scan-to-submap" : "scan-to-scan", submap_window_size_,
@@ -227,79 +272,122 @@ class NdtFrontendNode : public rclcpp::Node {
   }
 
  private:
-  // L5-06: fold one IMU sample into the predictor. Like the back-end (L5-01a) the
-  // sample is re-stamped with the node clock, because px4_offboard/imu_bridge.py
-  // forwards PX4 wall-clock stamps that cannot be differenced against the
-  // sim-time scan/optimized-state stream (bag-replay-clock-domain). Only the
-  // consecutive-sample dt is used; ImuPreintegrator drops dt<=0 itself.
-  void onImu(const sensor_msgs::msg::Imu::ConstSharedPtr& msg) {
-    const double stamp_s = now().seconds();
-    if (have_anchor_ && last_imu_stamp_ >= 0.0) {
-      predictor_->integrate(
-          Eigen::Vector3d(msg->linear_acceleration.x, msg->linear_acceleration.y,
-                          msg->linear_acceleration.z),
-          Eigen::Vector3d(msg->angular_velocity.x, msg->angular_velocity.y,
-                          msg->angular_velocity.z),
-          stamp_s - last_imu_stamp_);
-    }
-    last_imu_stamp_ = stamp_s;
-  }
-
-  // L5-06: re-seed the predictor from the back-end's freshest optimized keyframe
-  // state. The accumulated interval is cleared and the bias becomes the new
-  // linearization point, exactly as the back-end does at each keyframe — so from
-  // here the predictor dead-reckons off an optimized (pose, velocity, bias)
-  // instead of compounding its own drift.
+  // L5-19: refine exactly one submap window entry by stamp/id. Guess path untouched.
   void onOptimizedState(const graph_slam_msgs::msg::OptimizedState::ConstSharedPtr& msg) {
-    const gtsam::Rot3 rotation = gtsam::Rot3::Quaternion(
-        msg->pose.orientation.w, msg->pose.orientation.x, msg->pose.orientation.y,
-        msg->pose.orientation.z);
-    const gtsam::Point3 position(msg->pose.position.x, msg->pose.position.y,
-                                 msg->pose.position.z);
-    anchor_state_ = gtsam::NavState(rotation, position, toEigen(msg->velocity));
-    anchor_bias_ = gtsam::imuBias::ConstantBias(toEigen(msg->accel_bias),
-                                                toEigen(msg->gyro_bias));
-    predictor_->reset(anchor_bias_);
-    const bool first = !have_anchor_;
-    have_anchor_ = true;
-
-    // Re-latch the keyframe end of the guess onto the fresh anchor. The back-end
-    // only makes a keyframe when an ~/ndt_odom message arrives, and the
-    // front-end only emits one when it sets a keyframe — so this optimized state
-    // IS the back-end's take on the CURRENT keyframe, and the anchor is where
-    // that keyframe sits in the new chain. Without this, the next guess would
-    // difference a pose from the pre-reset chain against one from the post-reset
-    // chain and inject the whole dead-reckoning error plus the graph's pose
-    // correction into the seed. (What it does drop is the IMU between the
-    // keyframe's scan time and this message's arrival — the front-end->back-end
-    // round trip, ~27 ms; that is the L5-17 header-stamp window issue, out of
-    // scope here.)
-    if (have_keyframe_) {
-      predicted_at_keyframe_ = predictedPose();
-      // L5-07c: this optimized state is the back-end's take on the CURRENT
-      // (newest) keyframe (see the comment above), so it refines that window
-      // entry's pose from "IMU-predicted at creation" to "back-end optimized" —
-      // the submap must be rebuilt so it reflects the corrected pose.
-      if (!submap_keyframes_.empty()) {
-        submap_keyframes_.back().pose = *predicted_at_keyframe_;
-        rebuildTargetGrid();
-      }
+    if (!submap_enabled_ || submap_keyframes_.empty()) {
+      return;
     }
-    if (first) {
-      RCLCPP_INFO(get_logger(), "IMU predictor anchored on '%s' (first optimized state).",
-                  optimized_state_topic_.c_str());
+    OptimizedPoseUpdate update;
+    update.stamp_s = rclcpp::Time(msg->header.stamp).seconds();
+    update.keyframe_id = msg->keyframe_id;
+    update.pose = poseToMatrix(msg->pose);
+    const ApplyOptimizedResult applied = applyOptimizedPose(
+        submap_keyframes_, update, submap_collapse_eps_m_, submap_collapse_eps_rad_);
+    if (applied.status == ApplyOptimizedStatus::NoMatch) {
+      return;
+    }
+    if (applied.status == ApplyOptimizedStatus::Collapsed) {
+      RCLCPP_INFO(get_logger(),
+                  "submap collapsed to 1 keyframe after refined pose jump "
+                  "(stamp %.3f, id %d).",
+                  update.stamp_s, update.keyframe_id);
+    }
+    rebuildTargetGrid();
+  }
+
+  // L5-10: a coordinated batch of pose updates from ONE accepted loop closure
+  // — every keyframe in the back-end's affected range, applied as a single
+  // atomic pass (applyOptimizedPoseBatch), never as N independent
+  // applyOptimizedPose() calls. The window's clouds are never discarded here:
+  // poses move, the grid rebuilds once (only if the max shift crosses the
+  // configured ε — thrashing guard), same window size before and after.
+  void onOptimizedStateBatch(
+      const graph_slam_msgs::msg::OptimizedStateBatch::ConstSharedPtr& msg) {
+    if (!submap_enabled_ || submap_keyframes_.empty()) {
+      return;
+    }
+    std::vector<OptimizedPoseUpdate> updates;
+    updates.reserve(msg->states.size());
+    for (const auto& state : msg->states) {
+      OptimizedPoseUpdate update;
+      update.stamp_s = rclcpp::Time(state.header.stamp).seconds();
+      update.keyframe_id = state.keyframe_id;
+      update.pose = poseToMatrix(state.pose);
+      updates.push_back(update);
+    }
+
+    const std::size_t window_size_before = submap_keyframes_.size();
+    const BatchApplyResult applied = applyOptimizedPoseBatch(
+        submap_keyframes_, updates, submap_rebuild_eps_m_, submap_rebuild_eps_rad_);
+    if (applied.matched_count == 0) {
+      RCLCPP_DEBUG(get_logger(),
+                  "loop-closure batch: 0/%zu updates matched the active submap "
+                  "window (window outside the affected range); no work done.",
+                  updates.size());
+      return;
+    }
+
+    if (applied.should_rebuild) {
+      rebuildTargetGrid();
+    }
+    RCLCPP_INFO(get_logger(),
+                "L5-10 loop-closure submap update: %zu/%zu updates matched, max "
+                "shift %.3f m / %.3f rad, window %zu -> %zu entries, rebuild=%d.",
+                applied.matched_count, updates.size(), applied.max_shift_m,
+                applied.max_shift_rad, window_size_before, submap_keyframes_.size(),
+                static_cast<int>(applied.should_rebuild));
+  }
+
+  // L5-18a: buffer one PX4 EKF2 pose, keyed by its ORIGINAL header stamp (the
+  // adapter already publishes in the SLAM clock domain, so no re-stamping here —
+  // and clock reconciliation never belongs inside graph_slam). Samples arrive in
+  // stamp order, so the deque stays sorted and a plain prune from the front
+  // bounds it to the horizon.
+  void onEkf2(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
+    Ekf2Sample sample;
+    sample.stamp_s = rclcpp::Time(msg->header.stamp).seconds();
+    sample.pose = poseToMatrix(msg->pose.pose);
+    if (!ekf2_buffer_.empty() && sample.stamp_s < ekf2_buffer_.back().stamp_s) {
+      return;  // out-of-order sample: would break the sorted-buffer invariant
+    }
+    ekf2_buffer_.push_back(sample);
+    while (!ekf2_buffer_.empty() &&
+           (sample.stamp_s - ekf2_buffer_.front().stamp_s) > ekf2_buffer_seconds_) {
+      ekf2_buffer_.pop_front();
+    }
+    if (!logged_first_ekf2_) {
+      logged_first_ekf2_ = true;
+      RCLCPP_INFO(get_logger(), "first EKF2 sample on '%s' (stamp %.3f s).",
+                  ekf2_topic_.c_str(), sample.stamp_s);
     }
   }
 
-  // The predictor's pose at the newest integrated IMU sample, in the anchor's
-  // (map) frame. Empty until the first optimized state arrives. Only ever
-  // consumed as a DIFFERENCE of two such poses, so the map/odom frame offset and
-  // the anchor's publish latency cancel out of the NDT guess.
-  std::optional<Eigen::Matrix4f> predictedPose() const {
-    if (!have_anchor_) {
+  // L5-18b: the buffered EKF2 pose nearest `stamp_s`. Nearest-stamp snap, like
+  // the rest of this project's time matching — no interpolation (deliberate; see
+  // the L5-17 audit). Absent when the buffer is empty or the closest sample is
+  // farther away than the match tolerance, in which case the caller falls back to
+  // an identity guess rather than seeding NDT with a stale pose.
+  std::optional<Eigen::Matrix4f> ekf2PoseAt(double stamp_s) const {
+    if (ekf2_buffer_.empty()) {
       return std::nullopt;
     }
-    return gtsamPoseToMatrix(predictor_->predict(anchor_state_, anchor_bias_).pose());
+    const auto after = std::lower_bound(
+        ekf2_buffer_.begin(), ekf2_buffer_.end(), stamp_s,
+        [](const Ekf2Sample& s, double t) { return s.stamp_s < t; });
+
+    const Ekf2Sample* best = nullptr;
+    if (after == ekf2_buffer_.end()) {
+      best = &ekf2_buffer_.back();
+    } else if (after == ekf2_buffer_.begin()) {
+      best = &(*after);
+    } else {
+      const Ekf2Sample& before = *std::prev(after);
+      best = (stamp_s - before.stamp_s) <= (after->stamp_s - stamp_s) ? &before : &(*after);
+    }
+    if (std::abs(best->stamp_s - stamp_s) > ekf2_max_time_diff_s_) {
+      return std::nullopt;
+    }
+    return best->pose;
   }
 
   void onScan(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
@@ -316,29 +404,38 @@ class NdtFrontendNode : public rclcpp::Node {
     }
     publishCloud(scan_raw_pub_, scan, msg->header);
 
-    // The IMU prediction for THIS scan; also latched as the keyframe reference if
-    // this scan becomes the keyframe, so both ends of the guess come from the
-    // same predictor.
-    const std::optional<Eigen::Matrix4f> predicted = predictedPose();
+    // Scan time = the LiDAR message's own header stamp (the true measurement
+    // instant), which is what both ends of the EKF2 guess are looked up against.
+    const double scan_stamp_s = rclcpp::Time(msg->header.stamp).seconds();
 
     // First accepted scan bootstraps the keyframe at the odom origin.
     if (!have_keyframe_) {
-      setKeyframe(scan, Eigen::Matrix4f::Identity(), predicted, msg->header);
+      setKeyframe(scan, Eigen::Matrix4f::Identity(), scan_stamp_s, msg->header);
       publishOdom(Eigen::Matrix4f::Identity(), Matrix6f::Zero(), msg->header.stamp);
       return;
     }
 
-    // L5-06: seed NDT with the IMU-predicted motion since the keyframe. Both
-    // poses come from the same predictor chain, so this is the dead-reckoned
-    // keyframe->scan transform; identity until the predictor has an anchor.
+    // L5-18b: seed NDT with the EKF2 motion over the keyframe->scan interval,
+    // T_guess = T_ekf2(t_keyframe)^-1 * T_ekf2(t_scan). Both ends are looked up
+    // from the SAME buffer at scan time (rather than latching the keyframe end
+    // when the keyframe was made), so the keyframe end can use an EKF2 sample
+    // that only arrived afterwards and is therefore a closer stamp match.
+    // Differencing two poses cancels EKF2's slow absolute drift; identity when
+    // either end has no sample within the match tolerance.
     Eigen::Matrix4f init_guess = Eigen::Matrix4f::Identity();
-    const bool used_prior = predicted && predicted_at_keyframe_;
+    const std::optional<Eigen::Matrix4f> ekf2_at_keyframe = ekf2PoseAt(keyframe_stamp_s_);
+    const std::optional<Eigen::Matrix4f> ekf2_at_scan = ekf2PoseAt(scan_stamp_s);
+    const bool used_prior = ekf2_at_keyframe && ekf2_at_scan;
     if (used_prior) {
-      init_guess = relativePoseGuess(*predicted_at_keyframe_, *predicted);
+      init_guess = relativePoseGuess(*ekf2_at_keyframe, *ekf2_at_scan);
     }
 
-    const RegistrationResult result =
+    const RegistrationResult aligned =
         NdtRegistrar{ndt_cfg_}.align(*target_grid_, scan, init_guess);
+    // L5-20: tell the gate whether init_guess was a real EKF2 prior. Identity
+    // fallback is "no information", so PriorInconsistent must not fire on it.
+    RegistrationResult result = aligned;
+    result.have_prior_guess = used_prior;
     const RegistrationStatus verdict = evaluateRegistration(result, gate_cfg_);
 
     // NDT-11 gate ENFORCEMENT: a rejected registration must not enter the
@@ -346,17 +443,26 @@ class NdtFrontendNode : public rclcpp::Node {
     // scan and leave the keyframe where it is; the next scan is retried
     // immediately.
     //
-    // L5-06c deletes the substitute-the-prior fallback that used to run here.
-    // It was safe only while the prior was EKF2 — an INDEPENDENT source. With
-    // the IMU-predicted guess it closes a positive feedback loop: the guess is
-    // published as if it were measured motion -> the back-end optimizes on it
-    // -> the corrupted optimized state re-anchors the very predictor that
-    // produced the guess. Measured on slam_loop_03: a drifting 0.36 m guess
-    // during a hover was published as real motion and the loop diverged to
-    // ATE 1203 m within 1 s. Choosing a better recovery than "skip" is L5-13.
+    // L5-06c deleted the substitute-the-prior fallback that used to run here,
+    // because with the back-end-anchored IMU guess it closed a positive feedback
+    // loop (a 0.36 m hover dead-reckoning guess published as measured motion
+    // diverged slam_loop_03 to ATE 1203 m within 1 s). L5-18 makes the prior an
+    // INDEPENDENT source again, which would make such a fallback safe — but
+    // whether "substitute the prior" beats "skip" is L5-13's recovery-policy
+    // call, not this story's, so the skip behaviour is left exactly as it is.
     if (verdict != RegistrationStatus::Reliable) {
-      RCLCPP_WARN(get_logger(), "NDT rejected (%s); scan skipped (guess t=%.3f m).",
-                  toString(verdict), init_guess.block<3, 1>(0, 3).norm());
+      const double support = result.total_points > 0
+                                 ? static_cast<double>(result.scored_points) /
+                                       static_cast<double>(result.total_points)
+                                 : 0.0;
+      const Eigen::Matrix4f guess_delta =
+          relativePoseGuess(result.initial_guess, result.transform);
+      RCLCPP_WARN(get_logger(),
+                  "NDT rejected (%s); scan skipped (guess t=%.3f m, support=%.2f, "
+                  "delta_t=%.3f m / %.2f deg).",
+                  toString(verdict), init_guess.block<3, 1>(0, 3).norm(), support,
+                  guess_delta.block<3, 1>(0, 3).norm(),
+                  rotationAngle(guess_delta) * 180.0 / M_PI);
       return;
     }
     const Eigen::Matrix4f& delta = result.transform;
@@ -368,7 +474,7 @@ class NdtFrontendNode : public rclcpp::Node {
                 "NDT: converged=%d iters=%d fitness=%.3f -> %s | moved %.3f m / %.2f deg | "
                 "prior=%s (guess t=%.3f m / %.2f deg)",
                 static_cast<int>(result.converged), result.iterations, result.fitness_score,
-                toString(verdict), moved_m, turned_deg, used_prior ? "IMU" : "identity",
+                toString(verdict), moved_m, turned_deg, used_prior ? "EKF2" : "identity",
                 init_guess.block<3, 1>(0, 3).norm(),
                 rotationAngle(init_guess) * 180.0 / M_PI);
 
@@ -378,22 +484,27 @@ class NdtFrontendNode : public rclcpp::Node {
     }
     const Eigen::Matrix4f world_from_current = world_from_keyframe_ * delta;
     publishOdom(world_from_current, sigma, msg->header.stamp);
-    setKeyframe(scan, world_from_current, predicted, msg->header);
+    setKeyframe(scan, world_from_current, scan_stamp_s, msg->header);
   }
 
-  // Promote `scan` to the active keyframe: push it (with its current best pose
-  // estimate) onto the L5-07 submap window, evict beyond the window size,
-  // rebuild the fused NDT target grid, store the world pose, and latch the IMU
-  // prediction at this instant as the reference end of the next scan's guess.
+  // Promote `scan` to the active keyframe: push it as an unrefined (front-end NDT)
+  // submap entry, evict beyond the window size, rebuild the fused NDT target grid,
+  // store the world pose, and record this scan's stamp as the keyframe end of the
+  // next EKF2 guess. Backend OptimizedState later refines the matching entry by
+  // stamp (L5-19).
   void setKeyframe(const CloudPtr& scan, const Eigen::Matrix4f& world_pose,
-                   const std::optional<Eigen::Matrix4f>& predicted,
-                   const std_msgs::msg::Header& header) {
+                   double stamp_s, const std_msgs::msg::Header& header) {
     world_from_keyframe_ = world_pose;
     have_keyframe_ = true;
-    predicted_at_keyframe_ = predicted;
+    keyframe_stamp_s_ = stamp_s;
 
-    submap_keyframes_.push_back(
-        SubmapKeyframe{scan, predicted.value_or(Eigen::Matrix4f::Identity())});
+    SubmapKeyframe entry;
+    entry.cloud = scan;
+    entry.pose = world_pose;
+    entry.stamp_s = stamp_s;
+    entry.keyframe_id = -1;
+    entry.refined = false;
+    submap_keyframes_.push_back(std::move(entry));
     while (submap_keyframes_.size() > static_cast<std::size_t>(submap_window_size_)) {
       submap_keyframes_.pop_front();
     }
@@ -402,27 +513,36 @@ class NdtFrontendNode : public rclcpp::Node {
     publishCloud(scan_target_pub_, scan, header);
   }
 
-  // L5-07c/L5-08a: fuse the sliding window into ONE NDT target grid. Every
-  // windowed cloud is transformed from its own local sensor frame into the
-  // newest (reference) keyframe's frame via relativePoseGuess() on the two
-  // keyframes' anchor-frame poses — the identical "relative motion from two
-  // absolute predicted poses" trick the L5-06 init guess already relies on, so
-  // this introduces no new frame convention. submap_enabled_=false (ablation)
-  // or a size-1 window both degrade to exactly the old single-scan target (the
-  // reference keyframe transformed by identity).
+  // L5-07c/L5-08a/L5-19d: fuse the sliding window into ONE NDT target grid.
+  // Only same-source poses are fused (planSubmapFusion); mixed refined/unrefined
+  // windows degrade to the newest cloud alone. Transforms use relativePoseGuess
+  // on the selected poses. submap_enabled_=false or a size-1 window both degrade
+  // to the old single-scan target.
   void rebuildTargetGrid() {
     target_grid_ = std::make_unique<NdtVoxelGrid>(grid_cfg_);
     if (submap_keyframes_.empty()) {
       return;
     }
-    if (!submap_enabled_ || submap_keyframes_.size() == 1) {
+    if (!submap_enabled_) {
       target_grid_->build(submap_keyframes_.back().cloud);
       return;
     }
 
-    const Eigen::Matrix4f pose_ref = submap_keyframes_.back().pose;
+    const SubmapFusionPlan plan = planSubmapFusion(submap_keyframes_);
+    if (plan.rejected_mixed_source) {
+      RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 2000,
+                            "submap refused mixed refined/unrefined fusion; "
+                            "using single-newest until backend catches up.");
+    }
+    if (plan.mode == SubmapFusionMode::SingleNewest || plan.indices.size() <= 1) {
+      target_grid_->build(submap_keyframes_.back().cloud);
+      return;
+    }
+
+    const Eigen::Matrix4f pose_ref = submap_keyframes_[plan.indices.back()].pose;
     auto merged = std::make_shared<Cloud>();
-    for (const auto& kf : submap_keyframes_) {
+    for (const std::size_t idx : plan.indices) {
+      const auto& kf = submap_keyframes_[idx];
       Cloud transformed;
       pcl::transformPointCloud(*kf.cloud, transformed, relativePoseGuess(pose_ref, kf.pose));
       *merged += transformed;
@@ -472,8 +592,11 @@ class NdtFrontendNode : public rclcpp::Node {
 
   // params
   std::string lidar_topic_;
-  std::string imu_topic_;
-  std::string optimized_state_topic_;
+  std::string ekf2_topic_;
+  double ekf2_buffer_seconds_ = 5.0;      // s, EKF2 pose buffer horizon
+  double ekf2_max_time_diff_s_ = 0.1;     // s, max |sample - target| for a match
+  std::string optimized_state_topic_;     // L5-19: submap pose feed only
+  std::string optimized_state_batch_topic_;  // L5-10: coordinated loop-closure feed
   std::string odom_frame_;
   std::string base_frame_;
   double min_translation_m_ = 0.3;
@@ -482,37 +605,39 @@ class NdtFrontendNode : public rclcpp::Node {
   bool submap_enabled_ = true;      // L5-07/08 ablation flag; false = scan-to-scan
   int submap_window_size_ = 8;      // N keyframe clouds held in the submap window
   double submap_voxel_leaf_ = 0.3;  // m, merged submap cloud downsample leaf
+  double submap_collapse_eps_m_ = 0.2;    // L5-19e: collapse window on refined jump
+  double submap_collapse_eps_rad_ = 0.1;  // L5-19e: ~5.7 deg
+  double submap_rebuild_eps_m_ = 0.2;     // L5-10: loop-closure batch rebuild threshold
+  double submap_rebuild_eps_rad_ = 0.1;   // L5-10: ~5.7 deg
   PreprocessConfig pre_cfg_;
   NdtGridConfig grid_cfg_;
   NdtConfig ndt_cfg_;
   RegistrationGateConfig gate_cfg_;
   QualityConfig quality_cfg_;
-  imu::PreintegrationConfig predictor_cfg_;
 
   // state
   std::unique_ptr<NdtVoxelGrid> target_grid_;
   Eigen::Matrix4f world_from_keyframe_ = Eigen::Matrix4f::Identity();
   bool have_keyframe_ = false;
+  // Header stamp of the scan that became the current keyframe — the t_keyframe
+  // end of the L5-18 EKF2 guess.
+  double keyframe_stamp_s_ = 0.0;
 
-  // L5-07 submap sliding window: last submap_window_size_ keyframe clouds, each
-  // tagged with its best-known map-frame pose (see rebuildTargetGrid()).
+  // L5-07/19 submap sliding window: last submap_window_size_ keyframe clouds.
+  // Poses start unrefined (NDT chain) and are replaced by backend-optimized
+  // poses matched by stamp/id (rebuildTargetGrid via planSubmapFusion).
   std::deque<SubmapKeyframe> submap_keyframes_;
 
-  // L5-06 IMU predictor: a second ImuPreintegrator (the back-end owns the one
-  // that feeds the ImuFactor) dead-reckoning from the latest optimized state.
-  // last_imu_stamp_ gives consecutive-sample dt and stays continuous across
-  // anchor resets — reset() clears the accumulated interval, not the clock.
-  std::optional<imu::ImuPreintegrator> predictor_;
-  gtsam::NavState anchor_state_;
-  gtsam::imuBias::ConstantBias anchor_bias_;
-  bool have_anchor_ = false;
-  double last_imu_stamp_ = -1.0;
-  std::optional<Eigen::Matrix4f> predicted_at_keyframe_;
+  // L5-18 EKF2 guess source: time-ordered PX4 EKF2 poses keyed by header stamp.
+  // Independent of the graph; optimized_state never seeds the guess.
+  std::deque<Ekf2Sample> ekf2_buffer_;
+  bool logged_first_ekf2_ = false;
 
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr scan_sub_;
-  rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
-  rclcpp::Subscription<graph_slam_msgs::msg::OptimizedState>::SharedPtr
-      optimized_state_sub_;
+  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr ekf2_sub_;
+  rclcpp::Subscription<graph_slam_msgs::msg::OptimizedState>::SharedPtr optimized_state_sub_;
+  rclcpp::Subscription<graph_slam_msgs::msg::OptimizedStateBatch>::SharedPtr
+      optimized_state_batch_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr scan_raw_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr scan_target_pub_;

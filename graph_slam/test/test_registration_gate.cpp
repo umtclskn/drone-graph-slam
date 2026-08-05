@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 #include <pcl/common/transforms.h>
 
+#include <cmath>
 #include <random>
 
 #include "graph_slam/ndt_registrar.hpp"
@@ -24,12 +25,16 @@ using graph_slam::RegistrationResult;
 using graph_slam::RegistrationStatus;
 
 /// Hand-build a RegistrationResult with a diagonal Hessian of given eigenvalues.
+/// L5-20 fields default to full support + guess == transform (Identity), so the
+/// new LowSupport / PriorInconsistent checks do not fire unless a test overrides.
 RegistrationResult makeResult(bool converged, double fitness,
                               const Eigen::Matrix<double, 6, 1>& eig) {
   RegistrationResult r;
   r.converged = converged;
   r.fitness_score = fitness;
   r.hessian = eig.asDiagonal();
+  r.scored_points = 100;
+  r.total_points = 100;
   return r;
 }
 
@@ -159,6 +164,59 @@ TEST(RegistrationGateTest, EndToEndFlagsDegenerateSceneButPassesFullScene) {
   EXPECT_EQ(evaluateRegistration(floor_only, cfg), RegistrationStatus::Degenerate);
   // Floor + two walls constrain all six DOF -> reliable.
   EXPECT_EQ(evaluateRegistration(full, cfg), RegistrationStatus::Reliable);
+}
+
+// --- L5-20: few points scored -> LowSupport ---------------------------------
+TEST(RegistrationGateTest, LowSupportIsRejected) {
+  RegistrationResult r = makeResult(true, -1.5, wellConditioned());
+  r.scored_points = 10;
+  r.total_points = 100;  // support_fraction = 0.1 < default 0.3
+  EXPECT_EQ(evaluateRegistration(r, defaultConfig()), RegistrationStatus::LowSupport);
+}
+
+TEST(RegistrationGateTest, SupportJustAboveThresholdIsReliable) {
+  RegistrationGateConfig cfg = defaultConfig();
+  cfg.min_scored_fraction = 0.3;
+  RegistrationResult r = makeResult(true, -1.5, wellConditioned());
+  r.scored_points = 30;
+  r.total_points = 100;  // exactly the threshold
+  EXPECT_EQ(evaluateRegistration(r, cfg), RegistrationStatus::Reliable);
+}
+
+// --- L5-20: NDT result far from the initial guess -> PriorInconsistent ------
+TEST(RegistrationGateTest, PriorInconsistentIsRejected) {
+  RegistrationResult r = makeResult(true, -1.5, wellConditioned());
+  // Guess is identity; NDT "solution" is 1 m away (default δ_t_max = 0.5 m).
+  r.transform(0, 3) = 1.0F;
+  EXPECT_EQ(evaluateRegistration(r, defaultConfig()),
+            RegistrationStatus::PriorInconsistent);
+}
+
+TEST(RegistrationGateTest, PriorInconsistentRotationRejects) {
+  RegistrationGateConfig cfg = defaultConfig();
+  cfg.max_guess_delta_rot = 0.1;  // ~5.7°
+  RegistrationResult r = makeResult(true, -1.5, wellConditioned());
+  // ~20° yaw about Z relative to identity guess.
+  const float yaw = 0.35F;
+  r.transform(0, 0) = std::cos(yaw);
+  r.transform(0, 1) = -std::sin(yaw);
+  r.transform(1, 0) = std::sin(yaw);
+  r.transform(1, 1) = std::cos(yaw);
+  EXPECT_EQ(evaluateRegistration(r, cfg), RegistrationStatus::PriorInconsistent);
+}
+
+TEST(RegistrationGateTest, GuessWithinEnvelopeIsReliable) {
+  RegistrationResult r = makeResult(true, -1.5, wellConditioned());
+  r.transform(0, 3) = 0.2F;  // well under 0.5 m
+  EXPECT_EQ(evaluateRegistration(r, defaultConfig()), RegistrationStatus::Reliable);
+}
+
+TEST(RegistrationGateTest, NoPriorSkipsGuessDeltaCheck) {
+  // Identity fallback (= no EKF2 sample) must not reject a large NDT correction.
+  RegistrationResult r = makeResult(true, -1.5, wellConditioned());
+  r.have_prior_guess = false;
+  r.transform(0, 3) = 1.0F;
+  EXPECT_EQ(evaluateRegistration(r, defaultConfig()), RegistrationStatus::Reliable);
 }
 
 }  // namespace

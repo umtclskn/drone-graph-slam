@@ -2,6 +2,8 @@
 
 #include <Eigen/Core>
 
+#include <cstddef>
+
 namespace graph_slam {
 
 /// 6x6 single-precision matrix. Namespace-level so a type change is one line, not
@@ -44,6 +46,25 @@ struct RegistrationResult {
   /// false -> the Hessian was (near-)singular, so the geometry-aware diagonal
   /// fallback was used. The node logs this per registration (NDT-12).
   bool sigma_from_hessian = false;
+
+  /// L5-20: points that landed in a non-empty target voxel and contributed to
+  /// the NDT score at the final pose. The registration gate uses
+  /// scored_points / total_points as the support fraction.
+  std::size_t scored_points = 0;
+
+  /// L5-20: size of the source cloud passed to align (denominator of support).
+  std::size_t total_points = 0;
+
+  /// L5-20: the initial guess fed to align. The gate computes
+  /// ξ = Log(T_guess^-1 · T_ndt) against `transform` for PriorInconsistent.
+  Eigen::Matrix4f initial_guess = Eigen::Matrix4f::Identity();
+
+  /// L5-20: true when `initial_guess` came from a real prior source (EKF2).
+  /// False when the caller fell back to identity because no prior was available
+  /// — identity then means "no information", not "I predict zero motion", so the
+  /// PriorInconsistent check must not run (it would reject legitimate large
+  /// first corrections). Default true so hand-built test results keep the check.
+  bool have_prior_guess = true;
 };
 
 }  // namespace graph_slam

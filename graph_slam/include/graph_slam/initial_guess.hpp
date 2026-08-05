@@ -4,12 +4,13 @@
 
 namespace graph_slam {
 
-/// Relative-motion seed for scan-to-scan NDT (NDT-08). Given two absolute poses
-/// in a common frame — since L5-06 the IMU-predicted pose at the keyframe and at
-/// the current scan — returns the relative transform
+/// Relative-motion seed for NDT (NDT-08). Given two absolute poses in a common
+/// frame — since L5-18 the PX4 EKF2 pose at the keyframe stamp and at the current
+/// scan stamp — returns the relative transform
 /// T_a_b = world_from_a^{-1} * world_from_b. This is the initial guess fed to
 /// NdtRegistrar::align; NDT is initial-guess sensitive, so a good prior is the
-/// biggest cheap accuracy win.
+/// biggest cheap accuracy win. Differencing two absolute poses is also what makes
+/// a drifting source usable: any slow common-mode drift cancels.
 ///
 /// ROS-free by design: the pose source is the caller's concern.
 inline Eigen::Matrix4f relativePoseGuess(const Eigen::Matrix4f& world_from_a,

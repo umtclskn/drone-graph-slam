@@ -20,7 +20,7 @@ setup(
     zip_safe=True,
     maintainer='umut',
     maintainer_email='umut@todo.todo',
-    description='PX4 offboard control: arm, takeoff, fly a rectangular loop, and land in SITL.',
+    description='PX4 offboard control: mission loop, bridges, and keyboard velocity teleop.',
     license='MIT',
     tests_require=['pytest'],
     entry_points={
@@ -31,6 +31,9 @@ setup(
             'ground_truth_bridge = px4_offboard.ground_truth_bridge:main',
             'gazebo_truth_bridge = px4_offboard.gazebo_truth_bridge:main',
             'ekf2_odometry_adapter = px4_offboard.ekf2_odometry_adapter:main',
+            # ARK-style keyboard velocity teleop (replaces offboard_control)
+            'velocity_teleop = px4_offboard.teleop.velocity_control:main',
+            'velocity_teleop_keyboard = px4_offboard.teleop.keyboard:main',
         ],
     },
 )

@@ -10,14 +10,15 @@
 #include <pcl/point_types.h>
 #include <pcl_conversions/pcl_conversions.h>
 
+#include <algorithm>
 #include <chrono>
-#include <graph_slam_msgs/msg/optimized_state.hpp>
+#include <map>
 #include <memory>
 #include <nav_msgs/msg/odometry.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <rosgraph_msgs/msg/clock.hpp>
-#include <sensor_msgs/msg/imu.hpp>
 #include <sensor_msgs/msg/point_cloud2.hpp>
+#include <string>
 #include <vector>
 
 #include "ndt_frontend_node.hpp"
@@ -57,26 +58,18 @@ sensor_msgs::msg::PointCloud2 makeSpreadCloud(const rclcpp::Time& stamp, float x
   return msg;
 }
 
-/// L5-06 anchor for the front-end IMU predictor: an optimized state at the
-/// origin moving at `vx` along +x, zero bias.
-graph_slam_msgs::msg::OptimizedState makeOptimizedState(const rclcpp::Time& stamp,
-                                                        double vx) {
-  graph_slam_msgs::msg::OptimizedState state;
-  state.header.stamp = stamp;
-  state.header.frame_id = "map";
-  state.pose.orientation.w = 1.0;
-  state.velocity.x = vx;
-  return state;
-}
-
-/// A stationary/constant-velocity IMU sample in ENU: the accelerometer measures
-/// specific force, so a body with zero world acceleration reads +g on z.
-sensor_msgs::msg::Imu makeLevelImu(const rclcpp::Time& stamp, double gravity) {
-  sensor_msgs::msg::Imu imu;
-  imu.header.stamp = stamp;  // ignored by the node, which re-stamps with its clock
-  imu.header.frame_id = "base_link";
-  imu.linear_acceleration.z = gravity;
-  return imu;
+/// L5-18 guess source: one PX4 EKF2 odometry sample (as republished in ENU by
+/// px4_offboard's ekf2_odometry_adapter), level and `x` metres along +x. The
+/// node keys its buffer on this header stamp and never re-stamps it, so the
+/// stamp passed here is exactly what the guess lookup sees.
+nav_msgs::msg::Odometry makeEkf2Odom(const rclcpp::Time& stamp, double x) {
+  nav_msgs::msg::Odometry odom;
+  odom.header.stamp = stamp;
+  odom.header.frame_id = "odom";
+  odom.child_frame_id = "base_link";
+  odom.pose.pose.position.x = x;
+  odom.pose.pose.orientation.w = 1.0;
+  return odom;
 }
 
 /// Node options that make EVERY registration fail the NDT-11 gate (impossible
@@ -118,24 +111,74 @@ TEST(NdtFrontendNodeTest, ConstructsAndSpinsWithoutCrashing) {
 TEST(NdtFrontendNodeTest, DeclaresDocumentedParameters) {
   const auto node = graph_slam::createNdtFrontendNode();
   EXPECT_EQ(node->get_parameter("lidar_topic").as_string(), "/x500/lidar_3d/points");
-  // L5-06: the guess inputs replaced ekf2_topic, which no longer exists.
-  EXPECT_EQ(node->get_parameter("imu_topic").as_string(), "/imu/data");
-  EXPECT_EQ(node->get_parameter("optimized_state_topic").as_string(),
-            "/slam/optimized_state");
-  EXPECT_FALSE(node->has_parameter("ekf2_topic"));
+  // L5-18: EKF2 is the guess source. L5-19 re-admits optimized_state for the
+  // submap target only — the guess still never reads it.
+  EXPECT_EQ(node->get_parameter("ekf2_topic").as_string(), "/odometry/ekf2");
+  EXPECT_DOUBLE_EQ(node->get_parameter("ekf2_buffer_seconds").as_double(), 5.0);
+  EXPECT_DOUBLE_EQ(node->get_parameter("ekf2_max_time_diff_s").as_double(), 0.1);
+  EXPECT_FALSE(node->has_parameter("imu_topic"));
+  EXPECT_EQ(node->get_parameter("optimized_state_topic").as_string(), "/slam/optimized_state");
   EXPECT_DOUBLE_EQ(node->get_parameter("min_translation_m").as_double(), 0.3);
   EXPECT_DOUBLE_EQ(node->get_parameter("min_rotation_deg").as_double(), 5.0);
   EXPECT_TRUE(node->get_parameter("publish_debug_clouds").as_bool());
-  // L5-07/08: scan-to-submap target + its ablation flag.
+  // L5-20: support-size + guess-delta gate knobs (defaults match the config struct).
+  EXPECT_DOUBLE_EQ(node->get_parameter("gate_min_scored_fraction").as_double(), 0.3);
+  EXPECT_DOUBLE_EQ(node->get_parameter("gate_max_guess_delta_t").as_double(), 0.5);
+  EXPECT_DOUBLE_EQ(node->get_parameter("gate_max_guess_delta_rot").as_double(), 0.17);
+  // L5-07/08/19: scan-to-submap target + its ablation flag + collapse ε.
   EXPECT_TRUE(node->get_parameter("submap_enabled").as_bool());
   EXPECT_EQ(node->get_parameter("submap_window_size").as_int(), 8);
   EXPECT_DOUBLE_EQ(node->get_parameter("submap_voxel_leaf").as_double(), 0.3);
+  EXPECT_DOUBLE_EQ(node->get_parameter("submap_collapse_eps_m").as_double(), 0.2);
+  EXPECT_DOUBLE_EQ(node->get_parameter("submap_collapse_eps_rad").as_double(), 0.1);
+  // L5-10: coordinated loop-closure rebuild feed + its rebuild-threshold ε.
+  EXPECT_EQ(node->get_parameter("optimized_state_batch_topic").as_string(),
+            "/slam/optimized_state_batch");
+  EXPECT_DOUBLE_EQ(node->get_parameter("submap_rebuild_eps_m").as_double(), 0.2);
+  EXPECT_DOUBLE_EQ(node->get_parameter("submap_rebuild_eps_rad").as_double(), 0.1);
 }
 
-// NDT-11 gate enforcement, no-prior branch: when every registration is
-// rejected and no optimized state ever arrived (so the L5-06 predictor has no
-// anchor), only the bootstrap odom message may appear — the rejected step must
-// NOT be published or advance the keyframe.
+// L5-18d / L5-19: the guess must stay independent of the graph (EKF2 only).
+// L5-19 re-admits `/slam/optimized_state` for the **submap target** — that is
+// allowed — but `/slam/optimized_odom` must still not feed the front-end, and
+// EKF2 must remain subscribed. A future change that routes the guess through
+// optimized_state would still be a behavioural regression (covered by bag
+// gates); structurally we encode "EKF2 present; optimized_odom absent".
+TEST(NdtFrontendNodeTest, GuessSubscribesToEkf2SubmapMayUseOptimizedState) {
+  const auto node = graph_slam::createNdtFrontendNode();
+  const std::string ekf2_topic = node->get_parameter("ekf2_topic").as_string();
+  const std::string opt_topic =
+      node->get_parameter("optimized_state_topic").as_string();
+  const std::string opt_batch_topic =
+      node->get_parameter("optimized_state_batch_topic").as_string();
+
+  rclcpp::executors::SingleThreadedExecutor exec;
+  exec.add_node(node);
+  // Graph discovery is asynchronous even in-process: spin until this node's own
+  // EKF2 subscription is visible, then the rest of its list is populated too.
+  std::map<std::string, std::vector<std::string>> subs;
+  for (int i = 0; i < 100 && subs.count(ekf2_topic) == 0; ++i) {
+    exec.spin_some(std::chrono::milliseconds(20));
+    subs = node->get_node_graph_interface()->get_subscriber_names_and_types_by_node(
+        node->get_name(), node->get_namespace());
+  }
+  exec.remove_node(node);
+
+  ASSERT_EQ(subs.count(ekf2_topic), 1U)
+      << "front-end must subscribe to the EKF2 guess source " << ekf2_topic;
+  EXPECT_EQ(subs.count(opt_topic), 1U)
+      << "L5-19: submap pose feed " << opt_topic << " must be subscribed";
+  EXPECT_EQ(subs.count(opt_batch_topic), 1U)
+      << "L5-10: coordinated loop-closure feed " << opt_batch_topic
+      << " must be subscribed";
+  EXPECT_EQ(subs.count("/slam/optimized_odom"), 0U)
+      << "back-end odometry must not feed the front-end";
+}
+
+// NDT-11 gate enforcement, no-prior branch: when every registration is rejected
+// and no EKF2 sample ever arrived (so the guess has no source), only the
+// bootstrap odom message may appear — the rejected step must NOT be published or
+// advance the keyframe.
 TEST(NdtFrontendNodeTest, GateRejectWithoutPriorSkipsScan) {
   const auto node = graph_slam::createNdtFrontendNode(rejectingGateOptions());
   auto helper = rclcpp::Node::make_shared("gate_test_helper_noprior");
@@ -164,43 +207,28 @@ TEST(NdtFrontendNodeTest, GateRejectWithoutPriorSkipsScan) {
   EXPECT_EQ(received.size(), 1U) << "rejected registration without a prior must not publish";
 }
 
-// L5-06c: a rejected registration is skipped even when the IMU predictor has a
-// perfectly good prediction available. This replaces the old
-// GateRejectFallsBackToEkf2Delta test: substituting the prior for the rejected
-// NDT output was safe while the prior was EKF2 (an independent source) but
-// became a feedback loop once the prior is the IMU prediction that the
-// back-end's own optimized state re-anchors (see the comment at the gate).
+// L5-18 + L5-13a: a rejected registration is skipped even when a perfectly good
+// EKF2 guess is available. Pre-L5-06 the front-end substituted the EKF2 delta
+// here; L5-06c removed that fallback and L5-13a made "skip" the only path.
+// L5-18 restores the independent guess but deliberately does NOT restore the
+// fallback (recovery policy is L5-13's story), so the skip must still hold.
 //
-// The setup also exercises the whole L5-06 plumbing end to end — /imu/data
-// intake, the optimized-state anchor, and predict() — on a synthetic
-// constant-velocity segment: anchored at the origin at 1 m/s along +x and fed
-// 0.5 s of level IMU (zero world acceleration), so the prediction is a pure
-// 0.5 m translation in x. The analytic accuracy of that prediction is covered
-// closed-form by the L5-01d ImuPreintegrator tests; what is node-level here is
-// that the node feeds it and no longer publishes it as a measurement.
-//
-// The node runs on sim time driven by this test, so the IMU dt it re-stamps
-// with (bag-replay-clock-domain) is exact and the result is deterministic
-// rather than wall-clock dependent.
-TEST(NdtFrontendNodeTest, GateRejectSkipsScanEvenWithPrediction) {
-  constexpr double kGravity = 9.8;
-  constexpr double kVelocity = 1.0;  // m/s along +x
-  constexpr double kStep = 0.05;     // s between IMU samples
-  constexpr int kSamples = 10;       // -> 0.5 s of integration, i.e. 0.5 m in x
-
+// The setup also exercises the whole L5-18 guess plumbing end to end — EKF2
+// intake, the stamp-keyed buffer, and the two-stamp lookup — on a synthetic
+// 0.5 m step along +x. The node runs on sim time driven by this test, so the
+// stamps it matches on are exact and the result is deterministic rather than
+// wall-clock dependent.
+TEST(NdtFrontendNodeTest, GateRejectSkipsScanEvenWithEkf2Guess) {
   rclcpp::NodeOptions options = rejectingGateOptions();
   options.append_parameter_override("use_sim_time", true);
-  options.append_parameter_override("imu_gravity", kGravity);
   const auto node = graph_slam::createNdtFrontendNode(options);
 
-  auto helper = rclcpp::Node::make_shared("gate_test_helper_prediction");
+  auto helper = rclcpp::Node::make_shared("gate_test_helper_ekf2");
   auto clock_pub = helper->create_publisher<rosgraph_msgs::msg::Clock>("/clock", 10);
   auto scan_pub = helper->create_publisher<sensor_msgs::msg::PointCloud2>(
       node->get_parameter("lidar_topic").as_string(), 10);
-  auto imu_pub = helper->create_publisher<sensor_msgs::msg::Imu>(
-      node->get_parameter("imu_topic").as_string(), rclcpp::SensorDataQoS());
-  auto state_pub = helper->create_publisher<graph_slam_msgs::msg::OptimizedState>(
-      node->get_parameter("optimized_state_topic").as_string(), 10);
+  auto ekf2_pub = helper->create_publisher<nav_msgs::msg::Odometry>(
+      node->get_parameter("ekf2_topic").as_string(), rclcpp::QoS(50));
   std::vector<nav_msgs::msg::Odometry> received;
   auto odom_sub = helper->create_subscription<nav_msgs::msg::Odometry>(
       "/ndt_frontend/ndt_odom", 10,
@@ -226,25 +254,19 @@ TEST(NdtFrontendNodeTest, GateRejectSkipsScanEvenWithPrediction) {
   tick(0.0);
   ASSERT_NEAR(node->now().seconds(), sim_t, 1e-6) << "node is not on the test's sim clock";
 
-  state_pub->publish(makeOptimizedState(node->now(), kVelocity));  // anchor the predictor
+  ekf2_pub->publish(makeEkf2Odom(node->now(), 0.0));  // EKF2 at the keyframe stamp
   pump();
-  imu_pub->publish(makeLevelImu(node->now(), kGravity));  // primes last_imu_stamp_
-  pump();
-
-  scan_pub->publish(makeSpreadCloud(node->now()));  // bootstrap; latches prediction
+  scan_pub->publish(makeSpreadCloud(node->now()));    // bootstrap keyframe -> odom #1
   pump();
   ASSERT_EQ(received.size(), 1U);
 
-  for (int i = 0; i < kSamples; ++i) {
-    tick(kStep);
-    imu_pub->publish(makeLevelImu(node->now(), kGravity));
-    pump();
-  }
-
-  scan_pub->publish(makeSpreadCloud(node->now()));  // rejected -> must be skipped
+  tick(0.5);
+  ekf2_pub->publish(makeEkf2Odom(node->now(), 0.5));  // EKF2 says +0.5 m since the kf
+  pump();
+  scan_pub->publish(makeSpreadCloud(node->now()));    // rejected -> must be skipped
   pump();
   EXPECT_EQ(received.size(), 1U)
-      << "a rejected registration must not publish the IMU prediction as odometry";
+      << "a rejected registration must not publish the EKF2 guess as odometry";
 }
 
 // L5-07/08: node options for the submap scenario below — small motion
@@ -252,6 +274,12 @@ TEST(NdtFrontendNodeTest, GateRejectSkipsScanEvenWithPrediction) {
 // otherwise DEFAULT (non-rejecting) gate/quality thresholds, since this
 // scenario needs genuine NDT acceptance rather than the forced-reject trick
 // `rejectingGateOptions()` uses elsewhere in this file.
+//
+// L5-20: the synthetic 8³ cube only lands ~12 % of points in occupied voxels
+// (sparse vs ndt_resolution=1.0), so `gate_min_scored_fraction` is relaxed here
+// to exercise window growth rather than the support check (covered in
+// test_registration_gate). Guess-delta stays at the code default (0.5 m / 0.17
+// rad) — the synthetic EKF2 match is exact.
 rclcpp::NodeOptions submapNodeOptions(bool submap_enabled, int window_size) {
   rclcpp::NodeOptions options;
   options.parameter_overrides({
@@ -262,37 +290,33 @@ rclcpp::NodeOptions submapNodeOptions(bool submap_enabled, int window_size) {
       {"submap_window_size", window_size},
       {"submap_voxel_leaf", 0.3},
       {"use_sim_time", true},
+      {"gate_min_scored_fraction", 0.05},
   });
   return options;
 }
 
 // L5-07/08: bootstrap + two real, gate-accepted keyframes, each a synthetic
 // exact +0.5 m x-translation (the cube's local-frame points are shifted -0.5 m
-// per step to represent that real motion — see makeSpreadCloud's doc comment
-// — and the IMU predictor is fed the identical constant-velocity segment
-// GateRejectSkipsScanEvenWithPrediction uses, so the NDT init guess is a
-// near-exact match and default gate thresholds accept). By the third scan the
-// target (when submap_enabled) is the L5-07 submap merged from BOTH prior
-// keyframes (window_size=2), exercising the merge/voxel-downsample path, not
-// just the size-1 degenerate case.
+// per step to represent that real motion — see makeSpreadCloud's doc comment —
+// and EKF2 is fed the matching absolute poses 0.0/0.5/1.0 m at exactly the scan
+// stamps, so the L5-18 two-stamp guess is a near-exact match and default gate
+// thresholds accept). By the third scan the target (when submap_enabled) is the
+// L5-07 submap merged from BOTH prior keyframes (window_size=2), exercising the
+// merge/voxel-downsample path, not just the size-1 degenerate case — and, since
+// L5-18, exercising it with window poses taken from the node's own NDT odometry
+// chain rather than from any back-end feed.
 std::vector<nav_msgs::msg::Odometry> runSubmapScenario(bool submap_enabled, int window_size) {
-  constexpr double kGravity = 9.8;
-  constexpr double kVelocity = 1.0;  // m/s along +x
-  constexpr double kStep = 0.05;     // s between IMU samples
-  constexpr int kSamples = 10;       // -> 0.5 s -> 0.5 m per keyframe interval
+  constexpr double kInterval = 0.5;  // s between scans
 
-  rclcpp::NodeOptions options = submapNodeOptions(submap_enabled, window_size);
-  options.append_parameter_override("imu_gravity", kGravity);
+  const rclcpp::NodeOptions options = submapNodeOptions(submap_enabled, window_size);
   const auto node = graph_slam::createNdtFrontendNode(options);
 
   auto helper = rclcpp::Node::make_shared("submap_test_helper");
   auto clock_pub = helper->create_publisher<rosgraph_msgs::msg::Clock>("/clock", 10);
   auto scan_pub = helper->create_publisher<sensor_msgs::msg::PointCloud2>(
       node->get_parameter("lidar_topic").as_string(), 10);
-  auto imu_pub = helper->create_publisher<sensor_msgs::msg::Imu>(
-      node->get_parameter("imu_topic").as_string(), rclcpp::SensorDataQoS());
-  auto state_pub = helper->create_publisher<graph_slam_msgs::msg::OptimizedState>(
-      node->get_parameter("optimized_state_topic").as_string(), 10);
+  auto ekf2_pub = helper->create_publisher<nav_msgs::msg::Odometry>(
+      node->get_parameter("ekf2_topic").as_string(), rclcpp::QoS(50));
   std::vector<nav_msgs::msg::Odometry> received;
   auto odom_sub = helper->create_subscription<nav_msgs::msg::Odometry>(
       "/ndt_frontend/ndt_odom", 10,
@@ -314,32 +338,26 @@ std::vector<nav_msgs::msg::Odometry> runSubmapScenario(bool submap_enabled, int 
     clock_pub->publish(clock);
     pump();
   };
-  auto feedImuSegment = [&] {
-    for (int i = 0; i < kSamples; ++i) {
-      tick(kStep);
-      imu_pub->publish(makeLevelImu(node->now(), kGravity));
-      pump();
-    }
+  // One step of the flight: advance the clock, publish where EKF2 thinks the
+  // drone now is, then the scan the LiDAR would have taken there. Both carry the
+  // same stamp, so the guess lookup for this scan and for the previous keyframe
+  // both land on an exact sample.
+  auto step = [&](double ekf2_x, float cloud_offset) {
+    ekf2_pub->publish(makeEkf2Odom(node->now(), ekf2_x));
+    pump();
+    scan_pub->publish(makeSpreadCloud(node->now(), cloud_offset));
+    pump();
   };
 
   tick(0.0);
-  state_pub->publish(makeOptimizedState(node->now(), kVelocity));  // anchor the predictor
-  pump();
-  imu_pub->publish(makeLevelImu(node->now(), kGravity));  // primes last_imu_stamp_
-  pump();
+  step(0.0, 0.0F);  // bootstrap -> kf0
 
-  scan_pub->publish(makeSpreadCloud(node->now(), 0.0F));  // bootstrap -> kf0
-  pump();
+  tick(kInterval);
+  step(0.5, -0.5F);  // EKF2 guess +0.5 m, real +0.5 m -> kf1
 
-  feedImuSegment();                                        // predicts +0.5 m
-  scan_pub->publish(makeSpreadCloud(node->now(), -0.5F));  // real +0.5 m -> kf1
-  pump();
-
-  feedImuSegment();                                         // predicts +0.5 m more
-  scan_pub->publish(makeSpreadCloud(node->now(), -1.0F));  // real +0.5 m; registers
-                                                             // against the (possibly
-                                                             // 2-keyframe) submap
-  pump();
+  tick(kInterval);
+  step(1.0, -1.0F);  // another +0.5 m; registers against the (possibly
+                     // 2-keyframe) submap
 
   return received;
 }

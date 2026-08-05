@@ -4,9 +4,17 @@
 
 namespace graph_slam {
 
-/// Verdict of the registration gate (NDT-11): is this measurement trustworthy
-/// enough to become a graph edge? Anything other than `Reliable` is a rejection.
-enum class RegistrationStatus { Reliable, NotConverged, PoorFit, Degenerate };
+/// Verdict of the registration gate (NDT-11 + L5-20): is this measurement
+/// trustworthy enough to become a graph edge? Anything other than `Reliable` is
+/// a rejection.
+enum class RegistrationStatus {
+  Reliable,
+  NotConverged,
+  PoorFit,
+  Degenerate,
+  LowSupport,         // L5-20: too few scan points scored in the target grid
+  PriorInconsistent,  // L5-20: NDT solution far from the initial guess
+};
 
 /// Human-readable name of a verdict, for node logs. Centralised here so the ROS
 /// nodes (eval02/eval03/ndt_frontend) share one spelling instead of each copying
@@ -31,13 +39,26 @@ struct RegistrationGateConfig {
   /// Largest allowed Hessian condition number (max/min eigenvalue). Above this,
   /// one direction is far softer than the others (ambiguous scene) -> Degenerate.
   double max_condition_number = 1e4;
+
+  /// L5-20: minimum fraction of source points that must score in a non-empty
+  /// target voxel. Below this -> LowSupport (match may be an artefact on a
+  /// narrow structure). Conservative starting point; retune from bag stats.
+  double min_scored_fraction = 0.3;
+
+  /// L5-20: max translation of ξ = Log(T_guess^-1 · T_ndt) [m]. Rough 5σ of the
+  /// EKF2 keyframe→scan envelope under the current keyframe policy. Above ->
+  /// PriorInconsistent.
+  double max_guess_delta_t = 0.5;
+
+  /// L5-20: max rotation of ξ [rad] (~10°). Same envelope rationale as δ_t.
+  double max_guess_delta_rot = 0.17;
 };
 
 /// Decide whether a RegistrationResult is reliable enough to enter the graph.
 /// Pure function, ROS-free. Checks, in order: convergence -> fitness -> Hessian
-/// conditioning. The Hessian check catches symmetric/ambiguous scenes where the
-/// fit looks good but the pose is under-determined along some direction — the
-/// only signal for that is the degenerate direction of `result.hessian`.
+/// conditioning -> support fraction -> guess consistency. The Hessian check
+/// catches symmetric/ambiguous scenes; the L5-20 checks catch narrow-structure
+/// artefacts and NDT wander far from the (independent) initial guess.
 RegistrationStatus evaluateRegistration(const RegistrationResult& result,
                                         const RegistrationGateConfig& config);
 

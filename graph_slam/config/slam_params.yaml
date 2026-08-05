@@ -38,10 +38,15 @@
     ndt_sigma_t_fallback: 0.1        # m,   fallback translation std (degenerate H)
     ndt_sigma_max_condition: 1000000.0  # H condition number above this -> fallback
 
-    # Registration gate (NDT-11 RegistrationGateConfig)
+    # Registration gate (NDT-11 + L5-20 RegistrationGateConfig)
     gate_max_fitness_score: -0.5     # reject PoorFit when fitness ABOVE this
     gate_min_hessian_eigenvalue: 0.001
     gate_max_condition_number: 10000.0
+    # L5-20: support-size + guess-delta. Conservative 5σ-ish EKF2 keyframe→scan
+    # envelope; retune from bag rejection distribution if they false-reject.
+    gate_min_scored_fraction: 0.3    # reject LowSupport below this scored/total
+    gate_max_guess_delta_t: 0.5      # m, reject PriorInconsistent above ||ξ_t||
+    gate_max_guess_delta_rot: 0.17   # rad (~10°), reject PriorInconsistent above ||ξ_r||
 
     # Input-side scan quality gate (NDT-04 QualityConfig), read by
     # ndt_frontend_node. Flat keys (quality_*) to match the convention above.
@@ -52,27 +57,54 @@
     # block) to match the /** wildcard convention above: each maps to one
     # declare_parameter in the node, so a YAML edit retunes without a rebuild.
     lidar_topic: "/x500/lidar_3d/points"  # input cloud (remappable)
-    # L5-06: the NDT initial guess is IMU-predicted, not EKF2. The front-end runs
-    # its own ImuPreintegrator over imu_topic (same key/topic the back-end reads)
-    # and re-seeds it from optimized_state_topic, the back-end's typed
-    # (pose, velocity, imuBias) feed. `ekf2_topic` is gone: EKF2 is no longer a
-    # guess, a fallback, or a prior anywhere in the stack.
-    optimized_state_topic: "/slam/optimized_state"  # graph_slam_msgs/OptimizedState
+    # L5-18 (reverses L5-06): the NDT initial guess comes from PX4 EKF2 again —
+    # T_guess = T_ekf2(t_keyframe)^-1 * T_ekf2(t_scan), looked up by header stamp
+    # from a buffer of ekf2_topic. EKF2 runs inside PX4 firmware and consumes no
+    # graph_slam output, so the guess cannot be re-anchored from the graph's own
+    # estimate (the L5-06 feedback cycle that regressed XY 0.192 -> 0.647 m). Its
+    # unbounded indoor drift is harmless because only a DIFFERENCE over one
+    # keyframe->scan interval is used. EKF2 is a guess and ONLY a guess: still
+    # not a graph factor, not a gate fallback, not a bootstrap prior.
+    # L5-19: /slam/optimized_state is re-admitted solely as the submap TARGET pose
+    # feed (exact stamp/id match); it never seeds the guess.
+    # The EKF2 topic is standard nav_msgs/Odometry (ENU) from px4_offboard's
+    # ekf2_odometry_adapter, so graph_slam still never sees px4_msgs.
+    ekf2_topic: "/odometry/ekf2"          # nav_msgs/Odometry (ENU), PX4-01 adapter
+    ekf2_buffer_seconds: 5.0              # s, EKF2 pose buffer horizon
+    ekf2_max_time_diff_s: 0.1             # s, nearest-stamp match tolerance; beyond
+                                          # it the guess degrades to identity rather
+                                          # than seeding NDT with a stale pose
+    optimized_state_topic: "/slam/optimized_state"  # L5-19 submap pose feed
     odom_frame: "odom"                    # ~/ndt_odom header.frame_id
     base_frame: "base_link"               # ~/ndt_odom child_frame_id
     min_translation_m: 0.3                # keyframe trigger: translation since last KF
     min_rotation_deg: 5.0                 # keyframe trigger: rotation since last KF
     publish_debug_clouds: true            # ~/scan_raw + ~/scan_target debug topics
 
-    # L5-07/08 scan-to-submap target (ndt_frontend_node). The last
-    # submap_window_size keyframe clouds, each transformed to its optimized pose
-    # (LIO-SAM's extractSurroundingKeyFrames, adapted), are merged and voxel-
-    # downsampled into the NDT target. submap_enabled=false is the ablation flag:
-    # reproduces the pre-L5-07 single-scan (scan-to-scan) target exactly. N and
-    # leaf are tuned later (L5-09); start values only.
+    # L5-07/08/19 scan-to-submap target (ndt_frontend_node). The last
+    # submap_window_size keyframe clouds, each transformed by a same-source pose
+    # (backend-optimized once refined; front-end NDT only during bootstrap),
+    # are merged and voxel-downsampled into the NDT target. Mixed refined/
+    # unrefined fusion is refused. A large jump on an already-refined entry
+    # collapses the window (L5-19e); full ε-rebuild vs frozen submaps is L5-10.
+    # submap_enabled=false is the ablation flag: scan-to-scan. N/leaf tuned in L5-09.
     submap_enabled: true                  # false = scan-to-scan (ablation)
     submap_window_size: 8                 # N keyframe clouds held in the window
     submap_voxel_leaf: 0.3                # m, merged submap cloud downsample leaf
+    submap_collapse_eps_m: 0.2            # L5-19e: collapse window if refined jump
+    submap_collapse_eps_rad: 0.1          # L5-19e: ~5.7 deg
+
+    # L5-10: loop-closure coordinated submap rebuild (ndt_frontend_node). On
+    # /slam/optimized_state_batch (one message per accepted closure, covering the
+    # whole re-optimized keyframe range), every matching window entry's pose is
+    # updated in one atomic pass; the target grid rebuilds only if the max shift
+    # among already-refined entries exceeds EITHER threshold below (thrashing
+    # guard). Chosen on bags/slam_loop_03: below the L5-19e collapse ε (0.2 m /
+    # 0.1 rad) so a shift that would otherwise silently leave a stale target also
+    # triggers a rebuild well before it would reach collapse-worthy magnitude.
+    optimized_state_batch_topic: "/slam/optimized_state_batch"  # L5-10 batch feed
+    submap_rebuild_eps_m: 0.2             # m, loop-closure batch rebuild threshold
+    submap_rebuild_eps_rad: 0.1           # rad (~5.7 deg)
 
     # SLAM-01 keyframe policy (graph_backend_node). OR semantics: a keyframe is
     # due when ANY criterion is met; a non-positive value DISABLES a criterion.
@@ -98,17 +130,53 @@
     loop_min_sigma_eigenvalue: 0.000001  # reject if worst Hessian eigenvalue below this
     loop_max_condition_number: 10000.0   # reject if Hessian condition number above this
 
+    # L5-12: frozen historical submap target for loop-closure verification. The
+    # match keyframe's single cloud is replaced by keyframes [match-w, match+w]
+    # (backend-optimized poses, clamped below the query keyframe) fused + voxel-
+    # downsampled — more support, wider convergence basin (ARCHITECTURE §8), same
+    # reasoning as the L5-07/08 front-end scan-to-submap target.
+    loop_submap_window: 2                 # w: half-window size around match_key
+    loop_submap_voxel_leaf: 0.3           # m, fused submap cloud downsample leaf
+
+    # L5-12: χ² Mahalanobis gate + Huber kernel on the loop-closure BetweenFactor
+    # (single-graph path only). Checks the loop measurement's implied pose for the
+    # query keyframe against query's OWN current pose-graph marginal (there is no
+    # separate IMU prediction to preintegrate across a 10+ keyframe gap; the joint
+    # graph estimate already plays that role). Reuses the L5-21 gate machinery.
+    # Default ON (unlike the L5-21 odometry gate's default OFF): rejecting a loop
+    # candidate is risk-free — the graph just continues without that edge, same as
+    # the existing score/eigenvalue/condition-number rejections — so there is no
+    # cascade risk to weigh against the extra outlier protection.
+    loop_chi2_gate_enabled: true
+    loop_chi2_threshold: 16.811893829770927  # chi^2_0.99(6), stricter than the
+                                              # odometry gate's chi^2_0.999(6)=22.46
+    loop_huber_k: 1.345
+
+    # L5-10: on an accepted closure, publish the whole re-optimized keyframe
+    # range as one coordinated /slam/optimized_state_batch message so the
+    # front-end's submap can follow the shifted poses (see
+    # ndt_frontend_node's submap_rebuild_eps_* above). Ablation flag for the
+    # ON/OFF bag comparison this story's AC requires; OFF reproduces the
+    # pre-L5-10 behaviour (submap only ever tracks the newest keyframe).
+    loop_submap_rebuild_enabled: true
+
     # L5-01 IMU preintegration (graph_backend_node). IMU enters graph_slam as
     # sensor_msgs/Imu from px4_offboard/imu_bridge.py (FLU base_link, ENU-consistent).
-    # The backend RE-STAMPS each sample with its own clock (sim time under
-    # use_sim_time) because imu_bridge.py forwards PX4 wall-clock stamps, which can't
-    # be windowed against the sim-time keyframes/GT (bag-replay-clock-domain). Noise
+    # L5-17: the bridge now publishes /imu/data already in the SLAM clock domain
+    # (sim time under use_sim_time; OS-time pass-through on real hardware), and the
+    # back-end cuts each keyframe's preintegration window at the ndt_odom message's
+    # HEADER stamp (LIO-SAM's imuQueOpt pattern), with dt from consecutive IMU
+    # header stamps — the old node-clock re-stamp + arrival-time cut are gone. Noise
     # sigma = LIO-SAM params_drone_x500.yaml (tuned for this x500 sim bag → keeps the
     # ours-vs-LIO-SAM comparison fair). Gravity is ENU: MakeSharedU → n_g=(0,0,-g).
     # The bias-random-walk sigmas are stored for L5-03/04's BetweenFactor<imuBias>;
     # they are NOT part of the plain-ImuFactor PreintegrationParams.
     imu_topic: "/imu/data"                            # sensor_msgs/Imu (ENU/FLU base_link)
     imu_buffer_seconds: 5.0                           # bounded IMU sample buffer horizon
+    # L5-17e: inter-sample header-stamp gap above which the keyframe interval falls
+    # back to NDT+scaffolding (no ImuFactor across the gap). ~4 ms nominal period
+    # (250 Hz); 0.02 s = 5x nominal, far below the known ~134 ms slam_loop_03 step.
+    imu_max_dt_gap_s: 0.02
     imu_accel_noise_sigma: 0.0039939570888238808      # m/s^2/sqrt(Hz)
     imu_gyro_noise_sigma: 0.0015636343949698187       # rad/s/sqrt(Hz)
     imu_accel_bias_rw_sigma: 0.000064356659353532566  # m/s^3/sqrt(Hz)  (L5-03 bias factor)
@@ -128,6 +196,41 @@
     #   ndt_factor_enabled=false → IMU-only (drop the NDT edge; node held by ImuFactor)
     imu_factor_enabled: true
     ndt_factor_enabled: true
+
+    # L5-21: χ² consistency gate on NDT BetweenFactor vs IMU-predicted pose
+    # (single-graph only). χ² = ξᵀ (Σ_ndt + J Σ_x_pred Jᵀ)⁻¹ ξ, dof=6;
+    # Σ_x_pred = preintMeasCov rot+pos block. DEFAULT OFF: on slam_loop_03,
+    # strict-ON selectively drops late outliers (χ² ≫ 22.5) but IMU-only
+    # stretches then cascade (3D ATE 0.11 → 1.2–5.0 m). Enable for ablation /
+    # harder scenes; mode=soft inflates Σ instead of dropping.
+    # When enabled, accepted factors use Huber robust noise (k≈1.345).
+    ndt_consistency_gate_enabled: false
+    ndt_consistency_gate_mode: "strict"          # "strict" | "soft"
+    ndt_consistency_chi2_threshold: 22.457744484825323  # χ²_0.999(6)
+    ndt_huber_k: 1.345
+
+    # DUAL-GRAPH ablation (graph_backend_node, src/DUAL_GRAPH_ANALYSIS.md §5).
+    # false = the single graph above: ImuFactor and the NDT BetweenFactor share
+    #         the same X(i)/V(i)/B(i) nodes (byte-identical to the pre-dual code).
+    # true  = LIO-SAM's split. The mapping pose graph becomes Pose3-only (NDT
+    #         BetweenFactor + loop closures; no ImuFactor, no V/B keys), and the
+    #         IMU chain moves into a SEPARATE small iSAM2 (ImuStateEstimator)
+    #         where each NDT pose enters as an ABSOLUTE PriorFactor<Pose3>. That
+    #         side graph corrects on every ndt_odom message (~10 Hz, LIO-SAM's
+    #         per-mapping-publish cadence, ~3x the keyframe rate) and becomes the
+    #         source of /slam/optimized_state, i.e. of the front-end IMU guess.
+    #         Sigma_meas -> Sigma_prop -> BetweenFactor -> Sigma_post (ARCHITECTURE
+    #         §6) stays entirely in the pose graph either way.
+    dual_graph_enabled: false
+    # Noise of that absolute LiDAR prior. Hand-fixed constants, exactly LIO-SAM's
+    # correctionNoise (imuPreintegration.cpp:257): our Sigma_prop is a RELATIVE
+    # edge covariance and is not a valid absolute uncertainty for a drifting
+    # odometry pose. Only read when dual_graph_enabled: true.
+    dual_correction_rot_sigma: 0.05    # rad, per axis
+    dual_correction_pos_sigma: 0.1     # m, per axis
+    # Rebuild the side graph from the last node's marginals every N corrections so
+    # it stays O(1) forever (LIO-SAM's key==100 reset). <=0 disables.
+    dual_reset_key_interval: 100
 
     # L5-04 bootstrap priors (graph_backend_node): sigmas of the X(0)/V(0)/B(0)
     # PriorFactors created at the first NDT-odom message. Pose is tight at that

@@ -125,6 +125,10 @@ TEST(GraphBackendNodeTest, DeclaresDocumentedParameters) {
   EXPECT_DOUBLE_EQ(node->get_parameter("keyframe_translation_m").as_double(), 0.5);
   EXPECT_DOUBLE_EQ(node->get_parameter("keyframe_rotation_rad").as_double(), 0.5);
   EXPECT_DOUBLE_EQ(node->get_parameter("keyframe_time_s").as_double(), 10.0);
+  // L5-10: coordinated loop-closure submap-rebuild feed + its ablation flag.
+  EXPECT_EQ(node->get_parameter("optimized_state_batch_topic").as_string(),
+            "/slam/optimized_state_batch");
+  EXPECT_TRUE(node->get_parameter("loop_submap_rebuild_enabled").as_bool());
 }
 
 TEST(GraphBackendNodeTest, SyntheticOdomChainAddsKeyframes) {

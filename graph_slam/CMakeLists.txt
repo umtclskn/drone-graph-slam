@@ -48,15 +48,19 @@ add_library(${PROJECT_NAME}
   src/ndt_registrar.cpp
   src/pcl_ndt_baseline.cpp
   src/imu/imu_preintegrator.cpp
+  src/imu/imu_window_buffer.cpp
+  src/imu/imu_state_estimator.cpp
   src/registration_gate.cpp
   src/relative_error.cpp
   src/trajectory_metrics.cpp
   src/graph/graph_bootstrap.cpp
   src/graph/odometry_accumulator.cpp
   src/graph/odometry_factor_builder.cpp
+  src/graph/ndt_consistency_gate.cpp
   src/graph/graph_optimizer.cpp
   src/loop/loop_closure_candidate_finder.cpp
   src/loop/loop_closure_verifier.cpp
+  src/loop/loop_closure_submap.cpp
   src/eval/graph_visualizer.cpp)
 target_include_directories(${PROJECT_NAME} PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
@@ -138,6 +142,12 @@ if(BUILD_TESTING)
   # L5-01d: ROS-free ImuPreintegrator closed-form + covariance tests.
   ament_add_gtest(test_imu_preintegrator test/test_imu_preintegrator.cpp)
   target_link_libraries(test_imu_preintegrator ${PROJECT_NAME})
+  # L5-17: ROS-free header-stamp window cut (arrival-independence, snap, gaps).
+  ament_add_gtest(test_imu_window_buffer test/test_imu_window_buffer.cpp)
+  target_link_libraries(test_imu_window_buffer ${PROJECT_NAME})
+  # DUAL-GRAPH: ROS-free side-graph IMU state estimator (LIO-SAM port).
+  ament_add_gtest(test_imu_state_estimator test/test_imu_state_estimator.cpp)
+  target_link_libraries(test_imu_state_estimator ${PROJECT_NAME})
   ament_add_gtest(test_registration_gate test/test_registration_gate.cpp)
   target_link_libraries(test_registration_gate ${PROJECT_NAME})
   ament_add_gtest(test_ndt_covariance test/test_ndt_covariance.cpp)
@@ -159,6 +169,9 @@ if(BUILD_TESTING)
   target_link_libraries(test_odometry_accumulator ${PROJECT_NAME})
   ament_add_gtest(test_odometry_factor_builder test/test_odometry_factor_builder.cpp)
   target_link_libraries(test_odometry_factor_builder ${PROJECT_NAME})
+  # L5-21: χ² consistency gate + Huber factor builder.
+  ament_add_gtest(test_ndt_consistency_gate test/test_ndt_consistency_gate.cpp)
+  target_link_libraries(test_ndt_consistency_gate ${PROJECT_NAME})
   ament_add_gtest(test_graph_optimizer test/test_graph_optimizer.cpp)
   target_link_libraries(test_graph_optimizer ${PROJECT_NAME})
   ament_add_gtest(test_graph_visualizer test/test_graph_visualizer.cpp)
@@ -177,6 +190,9 @@ if(BUILD_TESTING)
   # SLAM-10: loop-closure verifier (ROS-free; links the compiled library).
   ament_add_gtest(test_loop_closure_verifier test/test_loop_closure_verifier.cpp)
   target_link_libraries(test_loop_closure_verifier ${PROJECT_NAME})
+  # L5-12: frozen historical submap fusion for loop-closure verification (ROS-free).
+  ament_add_gtest(test_loop_closure_submap test/test_loop_closure_submap.cpp)
+  target_link_libraries(test_loop_closure_submap ${PROJECT_NAME})
   # NDT-13 node smoke test: links the node TU (factory, no main) directly so it can
   # construct the node; needs the src/ private header and the node's ROS deps.
   ament_add_gtest(test_ndt_frontend_node
@@ -186,6 +202,10 @@ if(BUILD_TESTING)
   ament_target_dependencies(test_ndt_frontend_node
     rclcpp sensor_msgs nav_msgs geometry_msgs pcl_conversions tf2_ros graph_slam_msgs
     rosgraph_msgs)
+
+  # L5-19: ROS-free same-source submap fusion policy + exact stamp match updates.
+  ament_add_gtest(test_submap_pose_policy test/test_submap_pose_policy.cpp)
+  target_link_libraries(test_submap_pose_policy ${PROJECT_NAME})
 
   # INFRA-01: TF chain smoke test (map->odom->base_link lookup after first scan).
   ament_add_gtest(test_tf_tree test/test_tf_tree.cpp src/ndt_frontend_node.cpp)

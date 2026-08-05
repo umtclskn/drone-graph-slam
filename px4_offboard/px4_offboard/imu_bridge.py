@@ -5,9 +5,24 @@ Keeps the graph_slam package PX4-free: raw gyro/accel from
 sensor_msgs/Imu in body FLU on /imu/data. The SLAM front-end integrates
 angular_velocity between scans as an NDT rotation initial guess.
 
-Stamp note: PX4 timestamps (microseconds) are passed through unchanged.
-They live in PX4's clock domain, not sim time; consumers must only use
-them for intra-stream deltas, not for cross-topic matching.
+Stamp note (L5-17i): clock-domain reconciliation happens HERE, at the
+bridge, never inside graph_slam (SOTA LIO pattern; keeps the estimator
+clock-agnostic).
+- use_sim_time=true (SITL / bag replay): outgoing stamps come from the
+  NODE CLOCK (sim time, fed by the recorded /clock) — the same domain as
+  the LiDAR scans and therefore as /ndt_frontend/ndt_odom's header. The
+  raw PX4 stamp is NOT forwarded: it lives in PX4's own clock domain
+  (~1.78e9 s vs ~18-54 s sim time on slam_loop_03) and is unusable for
+  cross-topic windowing; on this project's SITL it additionally carries a
+  one-off ~132 ms lockstep step (L5_MICROSTORIES §L5-17 STEP-0). Same
+  restamp pattern already proven by imu_bridge_liosam.py. Non-advancing
+  stamps (sim clock only moves on /clock ticks, ~0.4 % of samples) are
+  dropped so downstream preintegration never sees dt <= 0.
+- use_sim_time=false (real hardware): PX4 timestamps are passed through
+  unchanged, exactly as before. uXRCE-DDS timesync (default-on) already
+  keeps PX4 stamps in the companion computer's OS-time domain, so the
+  pass-through is correct as-is (STEP-0b §Q2/§Q4) — this branch is a
+  deliberate no-op.
 """
 
 import rclpy
@@ -33,14 +48,35 @@ class ImuBridge(Node):
             SensorCombined, '/fmu/out/sensor_combined',
             self.callback, qos_profile_sensor_data)
         self.count = 0
+        # L5-17i: sim-time re-stamp is conditional on use_sim_time (see module
+        # docstring). rclpy auto-declares use_sim_time on every node.
+        self.sim_time = bool(self.get_parameter('use_sim_time').value)
+        self.last_stamp_ns = 0
+        self.dropped_same_stamp = 0
         self.get_logger().info(
-            'imu_bridge up: /fmu/out/sensor_combined (FRD) -> /imu/data (FLU)')
+            'imu_bridge up: /fmu/out/sensor_combined (FRD) -> /imu/data (FLU), '
+            f'stamps: {"node clock (sim time)" if self.sim_time else "PX4 pass-through"}')
 
     def callback(self, msg: SensorCombined):
         out = Imu()
         out.header.frame_id = 'base_link'
-        out.header.stamp.sec = int(msg.timestamp // 1_000_000)
-        out.header.stamp.nanosec = int((msg.timestamp % 1_000_000) * 1_000)
+        if self.sim_time:
+            # Node clock = sim time (recorded /clock on replay) — the domain
+            # ndt_odom/GT/scan headers live in, so consumers can window on the
+            # header stamp (L5-17c). Strictly monotonic: drop the ~0.4 % of
+            # samples where the sim clock has not advanced, else downstream
+            # preintegration would see dt <= 0.
+            now = self.get_clock().now()
+            if now.nanoseconds <= self.last_stamp_ns:
+                self.dropped_same_stamp += 1
+                return
+            self.last_stamp_ns = now.nanoseconds
+            out.header.stamp = now.to_msg()
+        else:
+            # Real hardware: PX4 stamps are already in the companion's OS-time
+            # domain via uXRCE-DDS timesync — pass through unchanged.
+            out.header.stamp.sec = int(msg.timestamp // 1_000_000)
+            out.header.stamp.nanosec = int((msg.timestamp % 1_000_000) * 1_000)
 
         # FRD -> FLU: x stays, y and z flip sign.
         out.angular_velocity.x = float(msg.gyro_rad[0])

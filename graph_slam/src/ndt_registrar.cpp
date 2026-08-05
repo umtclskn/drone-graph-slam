@@ -265,6 +265,12 @@ RegistrationResult NdtRegistrar::align(const NdtVoxelGrid& target, const CloudCo
   result.transform = matrixFromPose(p).cast<float>();
   result.hessian = d.H;
   result.fitness_score = d.scored > 0 ? d.f / static_cast<double>(d.scored) : 0.0;
+  // L5-20: support for the gate's LowSupport check + the guess the PriorInconsistent
+  // check diffs against. total_points is the full source size (including points that
+  // missed every target voxel); scored_points is d.scored at the final pose.
+  result.scored_points = d.scored;
+  result.total_points = source->size();
+  result.initial_guess = init_guess;
 
   // NDT-12: measurement covariance from the same Hessian (Sigma = lambda * H^-1,
   // reordered to Pose3 order), with the geometry-aware diagonal fallback when H is
